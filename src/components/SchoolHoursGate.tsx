@@ -70,8 +70,8 @@ export function SchoolHoursGate({ children }: { children: ReactNode }) {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center px-4 py-8">
-      <section className="glass-panel w-full max-w-xl rounded-[8px] p-6 shadow-soft sm:p-8">
+    <main className="flex min-h-[100dvh] items-center justify-center px-4 py-4 sm:py-8">
+      <section className="scrollbar-soft glass-panel max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-y-auto rounded-[8px] p-6 shadow-soft sm:max-h-[calc(100dvh-4rem)] sm:p-8">
         <div className="mb-6 flex h-12 w-12 items-center justify-center rounded-[8px] bg-sun/20 text-ink">
           {stayingLocked ? (
             <ShieldCheck aria-hidden="true" size={24} />

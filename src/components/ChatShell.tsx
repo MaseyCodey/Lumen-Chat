@@ -49,6 +49,10 @@ type Notice = {
   text: string;
 } | null;
 
+type LoadOptions = {
+  silent?: boolean;
+};
+
 type ChatShellProps = {
   profile: Profile;
   supabase: SupabaseClient;
@@ -324,6 +328,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
   const [isOffline, setIsOffline] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastTypingAtRef = useRef(0);
+  const lastReadAtByConversationRef = useRef(new Map<string, string | null>());
   const messageEndRef = useRef<HTMLDivElement | null>(null);
 
   const activeSummary = useMemo(
@@ -344,9 +349,11 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     return map;
   }, [activeSummary]);
 
-  const loadConversations = useCallback(async () => {
-    setIsLoadingConversations(true);
-    setNotice(null);
+  const loadConversations = useCallback(async (options: LoadOptions = {}) => {
+    if (!options.silent) {
+      setIsLoadingConversations(true);
+      setNotice(null);
+    }
 
     try {
       const { data: membershipRows, error: membershipError } = await supabase
@@ -362,6 +369,12 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         Record<string, unknown> & { conversation?: Conversation | Conversation[] }
       >;
       const conversationIds = memberships.map((row) => String(row.conversation_id));
+      lastReadAtByConversationRef.current = new Map(
+        memberships.map((row) => [
+          String(row.conversation_id),
+          row.last_read_at ? String(row.last_read_at) : null
+        ])
+      );
 
       if (conversationIds.length === 0) {
         setConversations([]);
@@ -468,7 +481,9 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
             : "Conversations could not be loaded."
       });
     } finally {
-      setIsLoadingConversations(false);
+      if (!options.silent) {
+        setIsLoadingConversations(false);
+      }
     }
   }, [profile.id, supabase]);
 
@@ -508,35 +523,54 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
 
   const markRead = useCallback(
     async (conversationId: string, nextMessages: Message[]) => {
-      const now = new Date().toISOString();
-
-      await supabase
-        .from("conversation_members")
-        .update({ last_read_at: now })
-        .eq("conversation_id", conversationId)
-        .eq("profile_id", profile.id);
-
-      const readRows = nextMessages
-        .filter((message) => message.sender_id !== profile.id)
+      const lastReadAt = lastReadAtByConversationRef.current.get(conversationId);
+      const lastReadMs = lastReadAt ? Date.parse(lastReadAt) : 0;
+      const unreadMessages = nextMessages.filter(
+        (message) =>
+          message.sender_id !== profile.id && Date.parse(message.created_at) > lastReadMs
+      );
+      const missingReadRows = unreadMessages
+        .filter(
+          (message) =>
+            !message.reads?.some((read) => read.profile_id === profile.id)
+        )
         .map((message) => ({
           message_id: message.id,
           profile_id: profile.id,
-          read_at: now
+          read_at: new Date().toISOString()
         }));
 
-      if (readRows.length > 0) {
+      if (unreadMessages.length === 0 && missingReadRows.length === 0) {
+        return;
+      }
+
+      const now = new Date().toISOString();
+
+      if (unreadMessages.length > 0) {
+        await supabase
+          .from("conversation_members")
+          .update({ last_read_at: now })
+          .eq("conversation_id", conversationId)
+          .eq("profile_id", profile.id);
+
+        lastReadAtByConversationRef.current.set(conversationId, now);
+      }
+
+      if (missingReadRows.length > 0) {
         await supabase
           .from("message_reads")
-          .upsert(readRows, { onConflict: "message_id,profile_id" });
+          .upsert(missingReadRows, { onConflict: "message_id,profile_id" });
       }
     },
     [profile.id, supabase]
   );
 
   const loadMessages = useCallback(
-    async (conversationId: string) => {
-      setIsLoadingMessages(true);
-      setMessageError(null);
+    async (conversationId: string, options: LoadOptions = {}) => {
+      if (!options.silent) {
+        setIsLoadingMessages(true);
+        setMessageError(null);
+      }
 
       try {
         const { data, error } = await supabase
@@ -558,7 +592,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         setMessages(nextMessages);
         await signAttachmentUrls(nextMessages);
         await markRead(conversationId, nextMessages);
-        await loadConversations();
+        await loadConversations({ silent: true });
       } catch (caughtError) {
         setMessageError(
           caughtError instanceof Error
@@ -566,7 +600,9 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
             : "Messages could not be opened."
         );
       } finally {
-        setIsLoadingMessages(false);
+        if (!options.silent) {
+          setIsLoadingMessages(false);
+        }
       }
     },
     [loadConversations, markRead, signAttachmentUrls, supabase]
@@ -617,9 +653,9 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
 
     function onOnline() {
       setIsOffline(false);
-      void loadConversations();
+      void loadConversations({ silent: true });
       if (activeConversationId) {
-        void loadMessages(activeConversationId);
+        void loadMessages(activeConversationId, { silent: true });
       }
     }
 
@@ -678,17 +714,17 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "conversation_members" },
-        () => void loadConversations()
+        () => void loadConversations({ silent: true })
       )
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "conversations" },
-        () => void loadConversations()
+        () => void loadConversations({ silent: true })
       )
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "messages" },
-        () => void loadConversations()
+        () => void loadConversations({ silent: true })
       )
       .subscribe();
 
@@ -722,8 +758,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
           filter: `conversation_id=eq.${activeConversationId}`
         },
         () => {
-          void loadMessages(activeConversationId);
-          void loadConversations();
+          void loadMessages(activeConversationId, { silent: true });
         }
       )
       .on(
@@ -734,7 +769,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
           table: "attachments",
           filter: `conversation_id=eq.${activeConversationId}`
         },
-        () => void loadMessages(activeConversationId)
+        () => void loadMessages(activeConversationId, { silent: true })
       )
       .on(
         "postgres_changes",
@@ -749,7 +784,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "message_reads" },
-        () => void loadMessages(activeConversationId)
+        () => void loadMessages(activeConversationId, { silent: true })
       )
       .subscribe();
 
@@ -782,7 +817,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
 
     setProfileSearch("");
     setProfileResults([]);
-    await loadConversations();
+    await loadConversations({ silent: true });
     setActiveConversationId(String(data));
   }
 
@@ -897,8 +932,8 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         .delete()
         .eq("conversation_id", activeConversationId)
         .eq("profile_id", profile.id);
-      await loadMessages(activeConversationId);
-      await loadConversations();
+      await loadMessages(activeConversationId, { silent: true });
+      await loadConversations({ silent: true });
     } catch (caughtError) {
       setNotice({
         type: "error",
@@ -918,7 +953,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     : "Select a conversation";
 
   return (
-    <main className="h-screen overflow-hidden px-3 py-3 sm:px-4 sm:py-4">
+    <main className="h-[100dvh] overflow-hidden px-3 py-3 sm:px-4 sm:py-4">
       <div className="glass-panel mx-auto flex h-full max-w-7xl overflow-hidden rounded-[8px] shadow-soft">
         <aside
           className={clsx(
@@ -1390,7 +1425,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
           onClose={() => setIsGroupComposerOpen(false)}
           onCreated={async (conversationId) => {
             setIsGroupComposerOpen(false);
-            await loadConversations();
+            await loadConversations({ silent: true });
             setActiveConversationId(conversationId);
           }}
           supabase={supabase}
@@ -1473,7 +1508,7 @@ function AttachmentPreview({
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             alt={attachment.file_name}
-            className="max-h-80 w-full object-cover"
+            className="max-h-80 w-full bg-black/5 object-contain"
             src={signedUrl}
           />
         </a>
@@ -1522,7 +1557,7 @@ function AttachmentPreview({
       <span className="min-w-0 flex-1">
         <span className="block truncate font-semibold">{attachment.file_name}</span>
         <span className={clsx("block text-xs", isMine ? "text-white/75" : "text-ink/55")}>
-          {meta} · {expiryText}
+          {meta} - {expiryText}
         </span>
       </span>
     </a>
@@ -1616,8 +1651,8 @@ function GroupComposer({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/35 px-4 py-8">
-      <section className="w-full max-w-xl rounded-[8px] border border-ink/10 bg-cloud p-5 shadow-soft sm:p-6">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/35 px-4 py-4 sm:py-8">
+      <section className="scrollbar-soft max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-y-auto rounded-[8px] border border-ink/10 bg-cloud p-5 shadow-soft sm:max-h-[calc(100dvh-4rem)] sm:p-6">
         <div className="flex items-center justify-between gap-4">
           <div>
             <h2 className="text-xl font-semibold text-ink">Create group chat</h2>

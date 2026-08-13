@@ -21,11 +21,11 @@ export function RulesModal() {
   }
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-ink/45 px-4 py-6">
+    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-ink/45 px-4 py-4 sm:py-6">
       <section
         aria-labelledby="rules-title"
         aria-modal="true"
-        className="w-full max-w-xl rounded-[8px] border border-ink/10 bg-cloud p-5 shadow-soft sm:p-6"
+        className="scrollbar-soft max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-y-auto rounded-[8px] border border-ink/10 bg-cloud p-5 shadow-soft sm:max-h-[calc(100dvh-3rem)] sm:p-6"
         role="dialog"
       >
         <div className="flex items-start gap-4">
