@@ -1,5 +1,6 @@
 "use client";
 
+import { withTimeout } from "@/lib/async";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { Loader2, LogIn, ShieldCheck, Sparkles, Users } from "lucide-react";
 import { useState } from "react";
@@ -18,19 +19,31 @@ export function AuthPanel({ supabase }: { supabase: SupabaseClient }) {
     setIsSigningIn(true);
     setError(null);
 
-    const { error: signInError } = await supabase.auth.signInWithOAuth({
-      provider: "google",
-      options: {
-        redirectTo: `${window.location.origin}/auth/callback`,
-        queryParams: {
-          access_type: "offline",
-          prompt: "consent"
-        }
-      }
-    });
+    try {
+      const { error: signInError } = await withTimeout(
+        supabase.auth.signInWithOAuth({
+          provider: "google",
+          options: {
+            redirectTo: `${window.location.origin}/auth/callback`,
+            queryParams: {
+              access_type: "offline",
+              prompt: "consent"
+            }
+          }
+        }),
+        12000,
+        "Google sign-in did not answer."
+      );
 
-    if (signInError) {
-      setError(signInError.message);
+      if (signInError) {
+        throw signInError;
+      }
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Google sign-in could not start."
+      );
       setIsSigningIn(false);
     }
   }

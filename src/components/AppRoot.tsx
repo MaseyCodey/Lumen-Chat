@@ -5,6 +5,7 @@ import { ChatShell } from "@/components/ChatShell";
 import { OnboardingModal } from "@/components/OnboardingModal";
 import { RulesModal } from "@/components/RulesModal";
 import { SchoolHoursGate } from "@/components/SchoolHoursGate";
+import { withTimeout } from "@/lib/async";
 import { createClient, isSupabaseConfigured } from "@/lib/supabase/client";
 import type { Profile } from "@/lib/types";
 import type { SupabaseClient, User } from "@supabase/supabase-js";
@@ -41,27 +42,31 @@ async function ensureProfile(supabase: SupabaseClient, user: User) {
     getString(user.user_metadata?.full_name) || getString(user.user_metadata?.name);
   const fallbackNames = splitDisplayName(metadataName);
 
-  const { data: existing, error: existingError } = await supabase
-    .from("profiles")
-    .select("*")
-    .eq("id", user.id)
-    .maybeSingle();
+  const { data: existing, error: existingError } = await withTimeout(
+    supabase.from("profiles").select("*").eq("id", user.id).maybeSingle(),
+    12000,
+    "The server did not answer while loading your profile."
+  );
 
   if (existingError) {
     throw existingError;
   }
 
   if (existing) {
-    const { data, error } = await supabase
-      .from("profiles")
-      .update({
-        email,
-        avatar_url: avatarUrl,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", user.id)
-      .select("*")
-      .single();
+    const { data, error } = await withTimeout(
+      supabase
+        .from("profiles")
+        .update({
+          email,
+          avatar_url: avatarUrl ?? existing.avatar_url,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", user.id)
+        .select("*")
+        .single(),
+      12000,
+      "The server did not answer while updating your profile."
+    );
 
     if (error) {
       throw error;
@@ -70,18 +75,22 @@ async function ensureProfile(supabase: SupabaseClient, user: User) {
     return data as Profile;
   }
 
-  const { data, error } = await supabase
-    .from("profiles")
-    .insert({
-      id: user.id,
-      email,
-      first_name: fallbackNames.firstName || null,
-      last_name: fallbackNames.lastName || null,
-      avatar_url: avatarUrl,
-      onboarding_complete: false
-    })
-    .select("*")
-    .single();
+  const { data, error } = await withTimeout(
+    supabase
+      .from("profiles")
+      .insert({
+        id: user.id,
+        email,
+        first_name: fallbackNames.firstName || null,
+        last_name: fallbackNames.lastName || null,
+        avatar_url: avatarUrl,
+        onboarding_complete: false
+      })
+      .select("*")
+      .single(),
+    12000,
+    "The server did not answer while creating your profile."
+  );
 
   if (error) {
     throw error;
@@ -182,7 +191,11 @@ export function AppRoot() {
         const {
           data: { session },
           error: sessionError
-        } = await client.auth.getSession();
+        } = await withTimeout(
+          client.auth.getSession(),
+          12000,
+          "The server did not answer while checking sign-in."
+        );
 
         if (sessionError) {
           throw sessionError;
@@ -220,22 +233,38 @@ export function AppRoot() {
     const {
       data: { subscription }
     } = client.auth.onAuthStateChange((_event, session) => {
+      if (!isMounted) {
+        return;
+      }
+
       if (!session?.user) {
         setProfile(null);
         setIsLoading(false);
         return;
       }
 
+      setIsLoading(true);
+      setError(null);
       ensureProfile(client, session.user)
-        .then((syncedProfile) => setProfile(syncedProfile))
-        .catch((caughtError) =>
-          setError(
-            caughtError instanceof Error
-              ? caughtError.message
-              : "The profile could not be loaded."
-          )
-        )
-        .finally(() => setIsLoading(false));
+        .then((syncedProfile) => {
+          if (isMounted) {
+            setProfile(syncedProfile);
+          }
+        })
+        .catch((caughtError) => {
+          if (isMounted) {
+            setError(
+              caughtError instanceof Error
+                ? caughtError.message
+                : "The profile could not be loaded."
+            );
+          }
+        })
+        .finally(() => {
+          if (isMounted) {
+            setIsLoading(false);
+          }
+        });
     });
 
     return () => {

@@ -1,6 +1,7 @@
 "use client";
 
 import { oneGigabyte } from "@/lib/types";
+import { withTimeout } from "@/lib/async";
 import type {
   Attachment,
   AttachmentKind,
@@ -50,8 +51,12 @@ type Notice = {
 } | null;
 
 type LoadOptions = {
+  markRead?: boolean;
+  refreshConversations?: boolean;
   silent?: boolean;
 };
+
+type RealtimeStatus = "connecting" | "connected" | "reconnecting";
 
 type ChatShellProps = {
   profile: Profile;
@@ -121,7 +126,10 @@ function normalizeMessage(row: Record<string, unknown>): Message {
 }
 
 function safeSearchTerm(value: string) {
-  return value.replace(/[%,]/g, " ").trim();
+  return value
+    .replace(/[^a-zA-Z0-9@._+\-\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function sanitizeFileName(value: string) {
@@ -326,10 +334,17 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
   const [isGroupComposerOpen, setIsGroupComposerOpen] = useState(false);
   const [typingProfiles, setTypingProfiles] = useState<Profile[]>([]);
   const [isOffline, setIsOffline] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] =
+    useState<RealtimeStatus>("connecting");
+  const [realtimeRetryKey, setRealtimeRetryKey] = useState(0);
+  const activeMessageIdsRef = useRef(new Set<string>());
+  const conversationRefreshTimerRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastTypingAtRef = useRef(0);
   const lastReadAtByConversationRef = useRef(new Map<string, string | null>());
+  const messageRefreshTimerRef = useRef<number | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
+  const realtimeReconnectTimerRef = useRef<number | null>(null);
 
   const activeSummary = useMemo(
     () =>
@@ -356,10 +371,14 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     }
 
     try {
-      const { data: membershipRows, error: membershipError } = await supabase
-        .from("conversation_members")
-        .select("conversation_id, role, joined_at, last_read_at, conversation:conversations(*)")
-        .eq("profile_id", profile.id);
+      const { data: membershipRows, error: membershipError } = await withTimeout(
+        supabase
+          .from("conversation_members")
+          .select("conversation_id, role, joined_at, last_read_at, conversation:conversations(*)")
+          .eq("profile_id", profile.id),
+        12000,
+        "The server did not answer while loading chats."
+      );
 
       if (membershipError) {
         throw membershipError;
@@ -383,19 +402,23 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       }
 
       const [{ data: memberRows, error: membersError }, { data: messageRows, error: messagesError }] =
-        await Promise.all([
-          supabase
-            .from("conversation_members")
-            .select("conversation_id, profile_id, role, joined_at, last_read_at, profile:profiles(*)")
-            .in("conversation_id", conversationIds),
-          supabase
-            .from("messages")
-            .select("*, attachment:attachments(*)")
-            .in("conversation_id", conversationIds)
-            .is("deleted_at", null)
-            .order("created_at", { ascending: false })
-            .limit(400)
-        ]);
+        await withTimeout(
+          Promise.all([
+            supabase
+              .from("conversation_members")
+              .select("conversation_id, profile_id, role, joined_at, last_read_at, profile:profiles(*)")
+              .in("conversation_id", conversationIds),
+            supabase
+              .from("messages")
+              .select("*, attachment:attachments(*)")
+              .in("conversation_id", conversationIds)
+              .is("deleted_at", null)
+              .order("created_at", { ascending: false })
+              .limit(400)
+          ]),
+          12000,
+          "The server did not answer while refreshing chats."
+        );
 
       if (membersError) {
         throw membersError;
@@ -473,13 +496,17 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         return nextSummaries[0]?.conversation.id ?? null;
       });
     } catch (caughtError) {
-      setNotice({
-        type: "error",
-        text:
-          caughtError instanceof Error
-            ? caughtError.message
-            : "Conversations could not be loaded."
-      });
+      if (options.silent) {
+        setRealtimeStatus("reconnecting");
+      } else {
+        setNotice({
+          type: "error",
+          text:
+            caughtError instanceof Error
+              ? caughtError.message
+              : "Conversations could not be loaded."
+        });
+      }
     } finally {
       if (!options.silent) {
         setIsLoadingConversations(false);
@@ -505,9 +532,13 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
 
       const entries = await Promise.all(
         attachments.map(async (attachment) => {
-          const { data } = await supabase.storage
-            .from(attachmentBucket)
-            .createSignedUrl(attachment.storage_path, 60 * 60);
+          const { data } = await withTimeout(
+            supabase.storage
+              .from(attachmentBucket)
+              .createSignedUrl(attachment.storage_path, 60 * 60),
+            8000,
+            "The private file link could not be prepared."
+          ).catch(() => ({ data: null }));
 
           return [attachment.id, data?.signedUrl ?? ""] as const;
         })
@@ -529,6 +560,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         (message) =>
           message.sender_id !== profile.id && Date.parse(message.created_at) > lastReadMs
       );
+      const now = new Date().toISOString();
       const missingReadRows = unreadMessages
         .filter(
           (message) =>
@@ -537,29 +569,35 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         .map((message) => ({
           message_id: message.id,
           profile_id: profile.id,
-          read_at: new Date().toISOString()
+          read_at: now
         }));
 
       if (unreadMessages.length === 0 && missingReadRows.length === 0) {
         return;
       }
 
-      const now = new Date().toISOString();
-
       if (unreadMessages.length > 0) {
-        await supabase
-          .from("conversation_members")
-          .update({ last_read_at: now })
-          .eq("conversation_id", conversationId)
-          .eq("profile_id", profile.id);
+        await withTimeout(
+          supabase
+            .from("conversation_members")
+            .update({ last_read_at: now })
+            .eq("conversation_id", conversationId)
+            .eq("profile_id", profile.id),
+          8000,
+          "Read status could not be saved."
+        );
 
         lastReadAtByConversationRef.current.set(conversationId, now);
       }
 
       if (missingReadRows.length > 0) {
-        await supabase
-          .from("message_reads")
-          .upsert(missingReadRows, { onConflict: "message_id,profile_id" });
+        await withTimeout(
+          supabase
+            .from("message_reads")
+            .upsert(missingReadRows, { onConflict: "message_id,profile_id" }),
+          8000,
+          "Read receipts could not be saved."
+        );
       }
     },
     [profile.id, supabase]
@@ -573,13 +611,17 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       }
 
       try {
-        const { data, error } = await supabase
-          .from("messages")
-          .select("*, attachment:attachments(*), reads:message_reads(*)")
-          .eq("conversation_id", conversationId)
-          .is("deleted_at", null)
-          .order("created_at", { ascending: true })
-          .limit(300);
+        const { data, error } = await withTimeout(
+          supabase
+            .from("messages")
+            .select("*, attachment:attachments(*), reads:message_reads(*)")
+            .eq("conversation_id", conversationId)
+            .is("deleted_at", null)
+            .order("created_at", { ascending: true })
+            .limit(300),
+          12000,
+          "The server did not answer while opening this chat."
+        );
 
         if (error) {
           throw error;
@@ -589,16 +631,27 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
           normalizeMessage(row as Record<string, unknown>)
         );
 
-        setMessages(nextMessages);
-        await signAttachmentUrls(nextMessages);
-        await markRead(conversationId, nextMessages);
-        await loadConversations({ silent: true });
-      } catch (caughtError) {
-        setMessageError(
-          caughtError instanceof Error
-            ? caughtError.message
-            : "Messages could not be opened."
+        activeMessageIdsRef.current = new Set(
+          nextMessages.map((message) => message.id)
         );
+        setMessages(nextMessages);
+        void signAttachmentUrls(nextMessages);
+        if (options.markRead !== false) {
+          void markRead(conversationId, nextMessages).catch(() => undefined);
+        }
+        if (options.refreshConversations !== false) {
+          void loadConversations({ silent: true });
+        }
+      } catch (caughtError) {
+        if (options.silent) {
+          setRealtimeStatus("reconnecting");
+        } else {
+          setMessageError(
+            caughtError instanceof Error
+              ? caughtError.message
+              : "Messages could not be opened."
+          );
+        }
       } finally {
         if (!options.silent) {
           setIsLoadingMessages(false);
@@ -610,12 +663,16 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
 
   const loadTyping = useCallback(
     async (conversationId: string) => {
-      const { data } = await supabase
-        .from("typing_indicators")
-        .select("profile:profiles(*)")
-        .eq("conversation_id", conversationId)
-        .neq("profile_id", profile.id)
-        .gt("expires_at", new Date().toISOString());
+      const { data } = await withTimeout(
+        supabase
+          .from("typing_indicators")
+          .select("profile:profiles(*)")
+          .eq("conversation_id", conversationId)
+          .neq("profile_id", profile.id)
+          .gt("expires_at", new Date().toISOString()),
+        5000,
+        "Typing indicators could not be loaded."
+      ).catch(() => ({ data: null }));
 
       const nextTypingProfiles = (data ?? [])
         .map((row) => single((row as Record<string, unknown>).profile as Profile | Profile[] | null))
@@ -625,6 +682,76 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     },
     [profile.id, supabase]
   );
+
+  const queueConversationsRefresh = useCallback(() => {
+    if (conversationRefreshTimerRef.current !== null) {
+      return;
+    }
+
+    conversationRefreshTimerRef.current = window.setTimeout(() => {
+      conversationRefreshTimerRef.current = null;
+      void loadConversations({ silent: true });
+    }, 350);
+  }, [loadConversations]);
+
+  const queueMessagesRefresh = useCallback(
+    (conversationId: string, options: LoadOptions = {}) => {
+      if (messageRefreshTimerRef.current !== null) {
+        return;
+      }
+
+      messageRefreshTimerRef.current = window.setTimeout(() => {
+        messageRefreshTimerRef.current = null;
+        void loadMessages(conversationId, { silent: true, ...options });
+      }, 350);
+    },
+    [loadMessages]
+  );
+
+  const scheduleRealtimeReconnect = useCallback(() => {
+    setRealtimeStatus("reconnecting");
+
+    if (realtimeReconnectTimerRef.current !== null) {
+      return;
+    }
+
+    realtimeReconnectTimerRef.current = window.setTimeout(() => {
+      realtimeReconnectTimerRef.current = null;
+      setRealtimeRetryKey((key) => key + 1);
+    }, 1500);
+  }, []);
+
+  const handleRealtimeStatus = useCallback(
+    (status: string) => {
+      if (status === "SUBSCRIBED") {
+        setRealtimeStatus("connected");
+        return;
+      }
+
+      if (
+        status === "CHANNEL_ERROR" ||
+        status === "TIMED_OUT"
+      ) {
+        scheduleRealtimeReconnect();
+      }
+    },
+    [scheduleRealtimeReconnect]
+  );
+
+  const retryRealtimeConnection = useCallback(() => {
+    if (realtimeReconnectTimerRef.current !== null) {
+      window.clearTimeout(realtimeReconnectTimerRef.current);
+      realtimeReconnectTimerRef.current = null;
+    }
+
+    setRealtimeStatus("connecting");
+    setRealtimeRetryKey((key) => key + 1);
+    void loadConversations({ silent: true });
+
+    if (activeConversationId) {
+      void loadMessages(activeConversationId, { silent: true });
+    }
+  }, [activeConversationId, loadConversations, loadMessages]);
 
   const announceTyping = useCallback(async () => {
     if (!activeConversationId) {
@@ -637,15 +764,23 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     }
 
     lastTypingAtRef.current = now;
-    await supabase.from("typing_indicators").upsert(
-      {
-        conversation_id: activeConversationId,
-        profile_id: profile.id,
-        updated_at: new Date().toISOString(),
-        expires_at: new Date(now + 6000).toISOString()
-      },
-      { onConflict: "conversation_id,profile_id" }
-    );
+    try {
+      await withTimeout(
+        supabase.from("typing_indicators").upsert(
+          {
+            conversation_id: activeConversationId,
+            profile_id: profile.id,
+            updated_at: new Date().toISOString(),
+            expires_at: new Date(now + 6000).toISOString()
+          },
+          { onConflict: "conversation_id,profile_id" }
+        ),
+        5000,
+        "Typing status could not be saved."
+      );
+    } catch {
+      // Typing indicators are best-effort and should never interrupt chatting.
+    }
   }, [activeConversationId, profile.id, supabase]);
 
   useEffect(() => {
@@ -653,14 +788,12 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
 
     function onOnline() {
       setIsOffline(false);
-      void loadConversations({ silent: true });
-      if (activeConversationId) {
-        void loadMessages(activeConversationId, { silent: true });
-      }
+      retryRealtimeConnection();
     }
 
     function onOffline() {
       setIsOffline(true);
+      setRealtimeStatus("reconnecting");
     }
 
     window.addEventListener("online", onOnline);
@@ -670,11 +803,27 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
     };
-  }, [activeConversationId, loadConversations, loadMessages]);
+  }, [retryRealtimeConnection]);
 
   useEffect(() => {
     void loadConversations();
   }, [loadConversations]);
+
+  useEffect(() => {
+    return () => {
+      if (conversationRefreshTimerRef.current !== null) {
+        window.clearTimeout(conversationRefreshTimerRef.current);
+      }
+
+      if (messageRefreshTimerRef.current !== null) {
+        window.clearTimeout(messageRefreshTimerRef.current);
+      }
+
+      if (realtimeReconnectTimerRef.current !== null) {
+        window.clearTimeout(realtimeReconnectTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const term = safeSearchTerm(profileSearch);
@@ -686,57 +835,104 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     }
 
     setIsSearchingProfiles(true);
+    let cancelled = false;
     const timeout = window.setTimeout(async () => {
-      const { data, error } = await supabase
-        .from("profiles")
-        .select("*")
-        .neq("id", profile.id)
-        .eq("onboarding_complete", true)
-        .or(`full_name.ilike.%${term}%,email.ilike.%${term}%`)
-        .limit(8);
+      try {
+        const { data, error } = await withTimeout(
+          supabase
+            .from("profiles")
+            .select("*")
+            .neq("id", profile.id)
+            .eq("onboarding_complete", true)
+            .or(`full_name.ilike.%${term}%,email.ilike.%${term}%`)
+            .limit(8),
+          10000,
+          "People search took too long."
+        );
 
-      if (error) {
-        setNotice({ type: "error", text: error.message });
-        setProfileResults([]);
-      } else {
-        setProfileResults((data ?? []) as Profile[]);
+        if (cancelled) {
+          return;
+        }
+
+        if (error) {
+          setNotice({ type: "error", text: error.message });
+          setProfileResults([]);
+        } else {
+          setProfileResults((data ?? []) as Profile[]);
+        }
+      } catch (caughtError) {
+        if (!cancelled) {
+          setNotice({
+            type: "error",
+            text:
+              caughtError instanceof Error
+                ? caughtError.message
+                : "People search failed."
+          });
+          setProfileResults([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsSearchingProfiles(false);
+        }
       }
-
-      setIsSearchingProfiles(false);
     }, 250);
 
-    return () => window.clearTimeout(timeout);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
   }, [profile.id, profileSearch, supabase]);
 
   useEffect(() => {
+    setRealtimeStatus("connecting");
+    const subscriptionTimeout = window.setTimeout(
+      scheduleRealtimeReconnect,
+      10000
+    );
     const channel = supabase
       .channel(`conversation-list-${profile.id}`)
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "conversation_members" },
-        () => void loadConversations({ silent: true })
+        () => queueConversationsRefresh()
       )
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "conversations" },
-        () => void loadConversations({ silent: true })
+        () => queueConversationsRefresh()
       )
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "messages" },
-        () => void loadConversations({ silent: true })
+        () => queueConversationsRefresh()
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          window.clearTimeout(subscriptionTimeout);
+        }
+
+        handleRealtimeStatus(status);
+      });
 
     return () => {
+      window.clearTimeout(subscriptionTimeout);
       void supabase.removeChannel(channel);
     };
-  }, [loadConversations, profile.id, supabase]);
+  }, [
+    handleRealtimeStatus,
+    profile.id,
+    queueConversationsRefresh,
+    realtimeRetryKey,
+    scheduleRealtimeReconnect,
+    supabase
+  ]);
 
   useEffect(() => {
     if (!activeConversationId) {
       setMessages([]);
       setTypingProfiles([]);
+      activeMessageIdsRef.current = new Set();
       return;
     }
 
@@ -746,6 +942,10 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     const typingInterval = window.setInterval(() => {
       void loadTyping(activeConversationId);
     }, 3500);
+    const subscriptionTimeout = window.setTimeout(
+      scheduleRealtimeReconnect,
+      10000
+    );
 
     const channel = supabase
       .channel(`conversation-room-${activeConversationId}`)
@@ -758,7 +958,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
           filter: `conversation_id=eq.${activeConversationId}`
         },
         () => {
-          void loadMessages(activeConversationId, { silent: true });
+          queueMessagesRefresh(activeConversationId);
         }
       )
       .on(
@@ -769,7 +969,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
           table: "attachments",
           filter: `conversation_id=eq.${activeConversationId}`
         },
-        () => void loadMessages(activeConversationId, { silent: true })
+        () => queueMessagesRefresh(activeConversationId, { markRead: false })
       )
       .on(
         "postgres_changes",
@@ -784,19 +984,48 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "message_reads" },
-        () => void loadMessages(activeConversationId, { silent: true })
+        (payload) => {
+          const row = (payload.new ?? payload.old) as
+            | Record<string, unknown>
+            | undefined;
+          const messageId = row?.message_id;
+
+          if (
+            typeof messageId === "string" &&
+            activeMessageIdsRef.current.has(messageId)
+          ) {
+            queueMessagesRefresh(activeConversationId, {
+              markRead: false,
+              refreshConversations: false
+            });
+          }
+        }
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          window.clearTimeout(subscriptionTimeout);
+        }
+
+        handleRealtimeStatus(status);
+      });
 
     return () => {
       window.clearInterval(typingInterval);
+      window.clearTimeout(subscriptionTimeout);
+      if (messageRefreshTimerRef.current !== null) {
+        window.clearTimeout(messageRefreshTimerRef.current);
+        messageRefreshTimerRef.current = null;
+      }
       void supabase.removeChannel(channel);
     };
   }, [
     activeConversationId,
-    loadConversations,
+    handleRealtimeStatus,
     loadMessages,
     loadTyping,
+    queueMessagesRefresh,
+    realtimeRetryKey,
+    scheduleRealtimeReconnect,
     supabase
   ]);
 
@@ -806,19 +1035,33 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
 
   async function startDirectConversation(target: Profile) {
     setNotice(null);
-    const { data, error } = await supabase.rpc("create_direct_conversation", {
-      target_profile_id: target.id
-    });
 
-    if (error) {
-      setNotice({ type: "error", text: error.message });
-      return;
+    try {
+      const { data, error } = await withTimeout(
+        supabase.rpc("create_direct_conversation", {
+          target_profile_id: target.id
+        }),
+        12000,
+        "The server did not answer while starting that chat."
+      );
+
+      if (error) {
+        throw error;
+      }
+
+      setProfileSearch("");
+      setProfileResults([]);
+      setActiveConversationId(String(data));
+      queueConversationsRefresh();
+    } catch (caughtError) {
+      setNotice({
+        type: "error",
+        text:
+          caughtError instanceof Error
+            ? caughtError.message
+            : "That chat could not be started."
+      });
     }
-
-    setProfileSearch("");
-    setProfileResults([]);
-    await loadConversations({ silent: true });
-    setActiveConversationId(String(data));
   }
 
   function selectFile(event: ChangeEvent<HTMLInputElement>) {
@@ -868,24 +1111,30 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       throw uploadError;
     }
 
-    const { data, error } = await supabase
-      .from("attachments")
-      .insert({
-        id: attachmentId,
-        conversation_id: conversationId,
-        uploader_id: profile.id,
-        storage_path: storagePath,
-        file_name: file.name,
-        file_type: file.type || "application/octet-stream",
-        file_size: file.size,
-        kind,
-        expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
-      })
-      .select("*")
-      .single();
+    const { data, error } = await withTimeout(
+      supabase
+        .from("attachments")
+        .insert({
+          id: attachmentId,
+          conversation_id: conversationId,
+          uploader_id: profile.id,
+          storage_path: storagePath,
+          file_name: file.name,
+          file_type: file.type || "application/octet-stream",
+          file_size: file.size,
+          kind,
+          expires_at: new Date(
+            Date.now() + 7 * 24 * 60 * 60 * 1000
+          ).toISOString()
+        })
+        .select("*")
+        .single(),
+      12000,
+      "The server did not answer while saving file details."
+    );
 
     if (error) {
-      await supabase.storage.from(attachmentBucket).remove([storagePath]);
+      void supabase.storage.from(attachmentBucket).remove([storagePath]);
       throw error;
     }
 
@@ -913,27 +1162,50 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         ? await uploadAttachment(activeConversationId, selectedFile)
         : null;
 
-      const { error } = await supabase.from("messages").insert({
-        conversation_id: activeConversationId,
-        sender_id: profile.id,
-        body: cleanBody || null,
-        message_type: attachment ? "attachment" : "text",
-        attachment_id: attachment?.id ?? null
-      });
+      const { data, error } = await withTimeout(
+        supabase
+          .from("messages")
+          .insert({
+            conversation_id: activeConversationId,
+            sender_id: profile.id,
+            body: cleanBody || null,
+            message_type: attachment ? "attachment" : "text",
+            attachment_id: attachment?.id ?? null
+          })
+          .select("*, attachment:attachments(*), reads:message_reads(*)")
+          .single(),
+        12000,
+        "The server did not answer while sending."
+      );
 
       if (error) {
         throw error;
       }
 
+      const sentMessage = normalizeMessage(data as Record<string, unknown>);
+      activeMessageIdsRef.current.add(sentMessage.id);
+      setMessages((current) =>
+        current.some((message) => message.id === sentMessage.id)
+          ? current
+          : [...current, sentMessage]
+      );
+      void signAttachmentUrls([sentMessage]);
       setMessageText("");
       clearSelectedFile();
-      await supabase
-        .from("typing_indicators")
-        .delete()
-        .eq("conversation_id", activeConversationId)
-        .eq("profile_id", profile.id);
-      await loadMessages(activeConversationId, { silent: true });
-      await loadConversations({ silent: true });
+      void withTimeout(
+        supabase
+          .from("typing_indicators")
+          .delete()
+          .eq("conversation_id", activeConversationId)
+          .eq("profile_id", profile.id),
+        8000,
+        "Typing status could not be cleared."
+      ).catch(() => undefined);
+      queueMessagesRefresh(activeConversationId, {
+        markRead: false,
+        refreshConversations: false
+      });
+      queueConversationsRefresh();
     } catch (caughtError) {
       setNotice({
         type: "error",
@@ -991,6 +1263,30 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
               <div className="mt-4 flex items-start gap-2 rounded-[8px] border border-coral/25 bg-coral/10 px-3 py-2 text-xs leading-5 text-coral">
                 <WifiOff className="mt-0.5 shrink-0" size={15} aria-hidden="true" />
                 You are offline. Existing messages stay visible, but sending is paused.
+              </div>
+            ) : null}
+
+            {!isOffline && realtimeStatus !== "connected" ? (
+              <div className="mt-4 flex items-center gap-2 rounded-[8px] border border-sun/35 bg-sun/15 px-3 py-2 text-xs leading-5 text-ink/70">
+                <Loader2
+                  className="shrink-0 animate-spin text-moss"
+                  size={15}
+                  aria-hidden="true"
+                />
+                <span className="min-w-0 flex-1">
+                  {realtimeStatus === "reconnecting"
+                    ? "Live updates are reconnecting."
+                    : "Connecting live updates."}
+                </span>
+                {realtimeStatus === "reconnecting" ? (
+                  <button
+                    className="shrink-0 rounded-[8px] border border-ink/10 bg-white px-2 py-1 font-semibold text-ink transition hover:border-moss hover:text-moss"
+                    onClick={retryRealtimeConnection}
+                    type="button"
+                  >
+                    Retry
+                  </button>
+                ) : null}
               </div>
             ) : null}
 
@@ -1423,10 +1719,10 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         <GroupComposer
           currentProfile={profile}
           onClose={() => setIsGroupComposerOpen(false)}
-          onCreated={async (conversationId) => {
+          onCreated={(conversationId) => {
             setIsGroupComposerOpen(false);
-            await loadConversations({ silent: true });
             setActiveConversationId(conversationId);
+            queueConversationsRefresh();
           }}
           supabase={supabase}
         />
@@ -1573,7 +1869,7 @@ function GroupComposer({
   currentProfile: Profile;
   supabase: SupabaseClient;
   onClose: () => void;
-  onCreated: (conversationId: string) => void | Promise<void>;
+  onCreated: (conversationId: string) => void;
 }) {
   const [title, setTitle] = useState("");
   const [query, setQuery] = useState("");
@@ -1593,27 +1889,56 @@ function GroupComposer({
     }
 
     setIsSearching(true);
+    let cancelled = false;
     const timeout = window.setTimeout(async () => {
-      const { data, error: searchError } = await supabase
-        .from("profiles")
-        .select("*")
-        .neq("id", currentProfile.id)
-        .eq("onboarding_complete", true)
-        .or(`full_name.ilike.%${term}%,email.ilike.%${term}%`)
-        .limit(10);
+      try {
+        const { data, error: searchError } = await withTimeout(
+          supabase
+            .from("profiles")
+            .select("*")
+            .neq("id", currentProfile.id)
+            .eq("onboarding_complete", true)
+            .or(`full_name.ilike.%${term}%,email.ilike.%${term}%`)
+            .limit(10),
+          10000,
+          "People search took too long."
+        );
 
-      if (searchError) {
-        setError(searchError.message);
-        setResults([]);
-      } else {
-        const selectedIds = new Set(selected.map((profile) => profile.id));
-        setResults(((data ?? []) as Profile[]).filter((profile) => !selectedIds.has(profile.id)));
+        if (cancelled) {
+          return;
+        }
+
+        if (searchError) {
+          setError(searchError.message);
+          setResults([]);
+        } else {
+          const selectedIds = new Set(selected.map((profile) => profile.id));
+          setResults(
+            ((data ?? []) as Profile[]).filter(
+              (profile) => !selectedIds.has(profile.id)
+            )
+          );
+        }
+      } catch (caughtError) {
+        if (!cancelled) {
+          setError(
+            caughtError instanceof Error
+              ? caughtError.message
+              : "People search failed."
+          );
+          setResults([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsSearching(false);
+        }
       }
-
-      setIsSearching(false);
     }, 250);
 
-    return () => window.clearTimeout(timeout);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
   }, [currentProfile.id, query, selected, supabase]);
 
   async function createGroup(event: FormEvent<HTMLFormElement>) {
@@ -1633,21 +1958,29 @@ function GroupComposer({
     setIsCreating(true);
     setError(null);
 
-    const { data, error: createError } = await supabase.rpc(
-      "create_group_conversation",
-      {
-        group_title: cleanTitle,
-        member_ids: selected.map((profile) => profile.id)
+    try {
+      const { data, error: createError } = await withTimeout(
+        supabase.rpc("create_group_conversation", {
+          group_title: cleanTitle,
+          member_ids: selected.map((profile) => profile.id)
+        }),
+        12000,
+        "The server did not answer while creating the group."
+      );
+
+      if (createError) {
+        throw createError;
       }
-    );
 
-    if (createError) {
-      setError(createError.message);
+      onCreated(String(data));
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "The group could not be created."
+      );
       setIsCreating(false);
-      return;
     }
-
-    await onCreated(String(data));
   }
 
   return (

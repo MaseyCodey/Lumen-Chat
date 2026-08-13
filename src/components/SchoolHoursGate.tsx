@@ -10,6 +10,22 @@ function getAcknowledgementKey(activeLock: ActiveLock) {
   return `lumen-school-lock-${activeLock.dayKey}-${activeLock.id}`;
 }
 
+function readAcknowledgement(key: string) {
+  try {
+    return window.localStorage.getItem(key) === "yes-understood";
+  } catch {
+    return false;
+  }
+}
+
+function writeAcknowledgement(key: string) {
+  try {
+    window.localStorage.setItem(key, "yes-understood");
+  } catch {
+    // If browser storage is blocked, keep the acknowledgement for this page load.
+  }
+}
+
 export function SchoolHoursGate({ children }: { children: ReactNode }) {
   const [activeLock, setActiveLock] = useState<ActiveLock | null>(null);
   const [isReady, setIsReady] = useState(false);
@@ -29,9 +45,7 @@ export function SchoolHoursGate({ children }: { children: ReactNode }) {
       }
 
       const key = getAcknowledgementKey(nextLock);
-      setAcknowledgedKey(
-        window.localStorage.getItem(key) === "yes-understood" ? key : null
-      );
+      setAcknowledgedKey(readAcknowledgement(key) ? key : null);
     }
 
     refresh();
@@ -64,7 +78,7 @@ export function SchoolHoursGate({ children }: { children: ReactNode }) {
       return;
     }
 
-    window.localStorage.setItem(acknowledgementKey, "yes-understood");
+    writeAcknowledgement(acknowledgementKey);
     setAcknowledgedKey(acknowledgementKey);
     setStayingLocked(false);
   }

@@ -1,5 +1,6 @@
 "use client";
 
+import { withTimeout } from "@/lib/async";
 import type { Profile } from "@/lib/types";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { Check, Loader2, ShieldCheck } from "lucide-react";
@@ -32,26 +33,37 @@ export function OnboardingModal({
     setIsSaving(true);
     setError(null);
 
-    const { data, error: updateError } = await supabase
-      .from("profiles")
-      .update({
-        first_name: cleanFirstName,
-        last_name: cleanLastName,
-        onboarding_complete: true,
-        real_name_confirmed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", profile.id)
-      .select("*")
-      .single();
+    try {
+      const { data, error: updateError } = await withTimeout(
+        supabase
+          .from("profiles")
+          .update({
+            first_name: cleanFirstName,
+            last_name: cleanLastName,
+            onboarding_complete: true,
+            real_name_confirmed_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", profile.id)
+          .select("*")
+          .single(),
+        12000,
+        "The server did not answer while saving your name."
+      );
 
-    if (updateError) {
-      setError(updateError.message);
+      if (updateError) {
+        throw updateError;
+      }
+
+      onComplete(data as Profile);
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Your name could not be saved."
+      );
       setIsSaving(false);
-      return;
     }
-
-    onComplete(data as Profile);
   }
 
   return (
@@ -76,11 +88,11 @@ export function OnboardingModal({
               className="h-12 w-12 rounded-[8px] object-cover"
               src={profile.avatar_url}
             />
-            <div>
+            <div className="min-w-0">
               <p className="text-sm font-semibold text-ink">
                 Google profile picture connected
               </p>
-              <p className="text-xs text-ink/60">{profile.email}</p>
+              <p className="truncate text-xs text-ink/60">{profile.email}</p>
             </div>
           </div>
         ) : null}
