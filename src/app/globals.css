@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  background: #f7f4ee;
+  color: #17211d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at top left, rgba(47, 183, 137, 0.18), transparent 34rem),
+    radial-gradient(circle at bottom right, rgba(238, 111, 87, 0.16), transparent 28rem),
+    #f7f4ee;
+  color: #17211d;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid rgba(47, 183, 137, 0.48);
+  outline-offset: 2px;
+}
+
+.scrollbar-soft {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(31, 111, 86, 0.32) transparent;
+}
+
+.scrollbar-soft::-webkit-scrollbar {
+  width: 10px;
+}
+
+.scrollbar-soft::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-soft::-webkit-scrollbar-thumb {
+  background: rgba(31, 111, 86, 0.32);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+.glass-panel {
+  border: 1px solid rgba(23, 33, 29, 0.1);
+  background: rgba(255, 253, 248, 0.78);
+  backdrop-filter: blur(22px);
+}
+
+.message-grid {
+  grid-template-columns: 2.5rem minmax(0, 1fr);
+}
