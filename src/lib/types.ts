@@ -43,6 +43,7 @@ export type Attachment = {
   file_size: number;
   kind: AttachmentKind;
   created_at: string;
+  expires_at: string;
 };
 
 export type MessageRead = {

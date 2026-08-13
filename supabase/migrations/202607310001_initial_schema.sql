@@ -57,6 +57,7 @@ create table if not exists public.attachments (
   file_size bigint not null check (file_size >= 0 and file_size <= 1073741824),
   kind text not null check (kind in ('image', 'gif', 'video', 'file')),
   created_at timestamptz not null default now(),
+  expires_at timestamptz not null default (now() + interval '7 days'),
   constraint attachment_path_scoped_to_conversation check (
     storage_path like conversation_id::text || '/%'
   )
@@ -106,6 +107,8 @@ create index if not exists messages_conversation_created_idx
   on public.messages (conversation_id, created_at desc);
 create index if not exists attachments_conversation_idx
   on public.attachments (conversation_id, created_at desc);
+create index if not exists attachments_expires_idx
+  on public.attachments (expires_at asc);
 create index if not exists message_reads_profile_idx
   on public.message_reads (profile_id, read_at desc);
 create index if not exists typing_indicators_expires_idx
@@ -320,6 +323,40 @@ begin
   from unnest(valid_member_ids) as member_id;
 
   return new_conversation_id;
+end;
+$$;
+
+create or replace function public.finalize_expired_attachments(
+  expired_attachment_ids uuid[]
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  deleted_count integer := 0;
+begin
+  if expired_attachment_ids is null or cardinality(expired_attachment_ids) = 0 then
+    return 0;
+  end if;
+
+  update public.messages
+  set
+    body = coalesce(nullif(body, ''), 'Attachment expired after 7 days.'),
+    attachment_id = null,
+    message_type = case
+      when message_type = 'attachment' then 'text'
+      else message_type
+    end,
+    updated_at = now()
+  where attachment_id = any(expired_attachment_ids);
+
+  delete from public.attachments
+  where id = any(expired_attachment_ids);
+
+  get diagnostics deleted_count = row_count;
+  return deleted_count;
 end;
 $$;
 
@@ -615,6 +652,7 @@ grant select, insert, update, delete on public.typing_indicators to authenticate
 grant execute on function public.create_direct_conversation(uuid) to authenticated;
 grant execute on function public.create_group_conversation(text, uuid[]) to authenticated;
 grant execute on function public.is_conversation_member(uuid, uuid) to authenticated;
+grant execute on function public.finalize_expired_attachments(uuid[]) to service_role;
 
 do $$
 begin

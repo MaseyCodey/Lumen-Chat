@@ -184,6 +184,23 @@ function formatConversationTime(value?: string | null) {
   }).format(date);
 }
 
+function formatAttachmentExpiry(value?: string | null) {
+  if (!value) {
+    return "Deletes after 7 days";
+  }
+
+  return `Deletes ${new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(new Date(value))}`;
+}
+
+function isAttachmentExpired(attachment: Attachment) {
+  return Date.parse(attachment.expires_at) <= Date.now();
+}
+
 function conversationTitle(summary: ConversationSummary, currentUserId: string) {
   if (summary.conversation.type === "group") {
     return summary.conversation.title || "Untitled group";
@@ -459,7 +476,13 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     async (nextMessages: Message[]) => {
       const attachments = nextMessages
         .map((message) => message.attachment)
-        .filter((attachment): attachment is Attachment => Boolean(attachment));
+        .filter((attachment): attachment is Attachment => {
+          if (!attachment) {
+            return false;
+          }
+
+          return !isAttachmentExpired(attachment);
+        });
 
       if (attachments.length === 0) {
         return;
@@ -820,7 +843,8 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         file_name: file.name,
         file_type: file.type || "application/octet-stream",
         file_size: file.size,
-        kind
+        kind,
+        expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
       })
       .select("*")
       .single();
@@ -1268,7 +1292,8 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                         {selectedFile.name}
                       </p>
                       <p className="text-xs text-ink/55">
-                        {formatFileSize(selectedFile.size)} of 1 GB max
+                        {formatFileSize(selectedFile.size)} of 1 GB max, deletes
+                        after 7 days
                       </p>
                     </div>
                     <button
@@ -1384,9 +1409,41 @@ function AttachmentPreview({
   signedUrl?: string;
   isMine: boolean;
 }) {
+  const expiryText = formatAttachmentExpiry(attachment.expires_at);
   const meta = `${formatFileSize(attachment.file_size)}${
     attachment.file_type ? `, ${attachment.file_type}` : ""
   }`;
+  const expired = isAttachmentExpired(attachment);
+
+  if (expired) {
+    return (
+      <div
+        className={clsx(
+          "mt-3 flex items-center gap-3 rounded-[8px] border px-3 py-3 text-sm",
+          isMine
+            ? "border-white/20 bg-white/10 text-white"
+            : "border-ink/10 bg-cloud text-ink"
+        )}
+      >
+        <span
+          className={clsx(
+            "flex h-10 w-10 shrink-0 items-center justify-center rounded-[8px]",
+            isMine ? "bg-white/15" : "bg-jade/15 text-moss"
+          )}
+        >
+          <AttachmentIcon kind={attachment.kind} />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate font-semibold">
+            {attachment.file_name}
+          </span>
+          <span className={clsx("block text-xs", isMine ? "text-white/75" : "text-ink/55")}>
+            Expired after 7 days
+          </span>
+        </span>
+      </div>
+    );
+  }
 
   if (!signedUrl) {
     return (
@@ -1406,28 +1463,38 @@ function AttachmentPreview({
 
   if (attachment.kind === "image" || attachment.kind === "gif") {
     return (
-      <a
-        className="mt-3 block overflow-hidden rounded-[8px] border border-black/10"
-        href={signedUrl}
-        rel="noreferrer"
-        target="_blank"
-      >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          alt={attachment.file_name}
-          className="max-h-80 w-full object-cover"
-          src={signedUrl}
-        />
-      </a>
+      <div className="mt-3">
+        <a
+          className="block overflow-hidden rounded-[8px] border border-black/10"
+          href={signedUrl}
+          rel="noreferrer"
+          target="_blank"
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            alt={attachment.file_name}
+            className="max-h-80 w-full object-cover"
+            src={signedUrl}
+          />
+        </a>
+        <p className={clsx("mt-1 text-xs", isMine ? "text-white/75" : "text-ink/55")}>
+          {expiryText}
+        </p>
+      </div>
     );
   }
 
   if (attachment.kind === "video") {
     return (
-      <div className="mt-3 overflow-hidden rounded-[8px] border border-black/10 bg-black">
-        <video className="max-h-80 w-full" controls src={signedUrl}>
-          <a href={signedUrl}>Open video</a>
-        </video>
+      <div className="mt-3">
+        <div className="overflow-hidden rounded-[8px] border border-black/10 bg-black">
+          <video className="max-h-80 w-full" controls src={signedUrl}>
+            <a href={signedUrl}>Open video</a>
+          </video>
+        </div>
+        <p className={clsx("mt-1 text-xs", isMine ? "text-white/75" : "text-ink/55")}>
+          {expiryText}
+        </p>
       </div>
     );
   }
@@ -1455,7 +1522,7 @@ function AttachmentPreview({
       <span className="min-w-0 flex-1">
         <span className="block truncate font-semibold">{attachment.file_name}</span>
         <span className={clsx("block text-xs", isMine ? "text-white/75" : "text-ink/55")}>
-          {meta}
+          {meta} · {expiryText}
         </span>
       </span>
     </a>

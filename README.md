@@ -22,6 +22,7 @@ only as the OAuth provider and profile-photo source.
 - Read receipts
 - Timestamps
 - Private image, GIF, video, and general file attachments up to 1 GB
+- Attachments expire after 7 days and are cleaned up by a secure daily job
 - Responsive mobile and desktop UI
 - Loading, error, offline, empty, and unauthorized states
 - Rules popup on every fresh website open
@@ -52,6 +53,8 @@ cp .env.example .env.local
 ```env
 NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
+SUPABASE_SERVICE_ROLE_KEY=your-private-service-role-key
+CRON_SECRET=make-a-random-secret-at-least-16-characters
 NEXT_PUBLIC_SITE_URL=http://localhost:3000
 ```
 
@@ -99,6 +102,7 @@ The migration creates:
 - a private `chat-attachments` storage bucket
 - RLS policies that only allow conversation members to view chat data and files
 - RPC helpers for creating direct and group conversations
+- attachment expiration support
 - indexes and triggers for search, timestamps, and conversation ordering
 - Realtime publication entries for live updates
 
@@ -109,9 +113,42 @@ The migration sets the `chat-attachments` bucket `file_size_limit` to
 allow uploads of that size.
 
 Files are stored privately. The app creates short-lived signed links only for
-members of the conversation.
+members of the conversation. Each attachment gets an `expires_at` timestamp 7
+days after upload. The app stops opening expired files, and a Vercel Cron route
+deletes expired storage objects through the Supabase Storage API.
 
-## 5. Install and Run Locally
+Supabase recommends deleting Storage files through the Storage API instead of
+direct SQL, because deleting `storage.objects` rows directly can leave orphaned
+files behind.
+
+## 5. Attachment Cleanup
+
+The app includes a secure cleanup route at:
+
+```text
+/api/cleanup-attachments
+```
+
+Vercel runs it once per day using `vercel.json`. Hobby/free Vercel accounts only
+support daily cron jobs, which is enough for weekly file expiration.
+
+Add these private environment variables in Vercel:
+
+```env
+SUPABASE_SERVICE_ROLE_KEY=your-private-service-role-key
+CRON_SECRET=make-a-random-secret-at-least-16-characters
+```
+
+Keep `SUPABASE_SERVICE_ROLE_KEY` private. Never add `NEXT_PUBLIC_` to it.
+
+The daily job:
+
+1. Finds attachments older than 7 days.
+2. Deletes the real files through Supabase Storage.
+3. Updates old chat messages to say the attachment expired.
+4. Deletes the attachment metadata.
+
+## 6. Install and Run Locally
 
 ```bash
 npm install
@@ -124,7 +161,7 @@ Open:
 http://localhost:3000
 ```
 
-## 6. Testing and Checks
+## 7. Testing and Checks
 
 ```bash
 npm run lint
@@ -142,7 +179,7 @@ To test realtime messaging:
 6. Send text, images, GIFs, videos, and files.
 7. Confirm messages, unread badges, typing indicators, and read receipts update without refreshing.
 
-## 7. Deploy to Vercel
+## 8. Deploy to Vercel
 
 1. Push this repository to GitHub.
 2. Import the repository in Vercel.
@@ -152,6 +189,8 @@ To test realtime messaging:
 NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
 NEXT_PUBLIC_SITE_URL=https://your-vercel-domain.vercel.app
+SUPABASE_SERVICE_ROLE_KEY=your-private-service-role-key
+CRON_SECRET=make-a-random-secret-at-least-16-characters
 ```
 
 4. Deploy.
