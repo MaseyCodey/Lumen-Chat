@@ -29,6 +29,7 @@ import {
   MessageCircle,
   MoreHorizontal,
   Paperclip,
+  Palette,
   Plus,
   Search,
   Send,
@@ -56,6 +57,102 @@ const adminEmails = new Set([
   "mase.hellerud@unbound.school"
 ]);
 const groupImageLimit = 5 * 1024 * 1024;
+
+const themeOptions = [
+  {
+    id: "lumen",
+    name: "Lumen",
+    note: "Clean green and warm coral.",
+    swatches: ["#1f6f56", "#2fb789", "#ee6f57"]
+  },
+  {
+    id: "midnight-arena",
+    name: "Midnight Arena",
+    note: "Competitive shooter lobby energy.",
+    swatches: ["#2563eb", "#22d3ee", "#f43f5e"]
+  },
+  {
+    id: "block-builder",
+    name: "Block Builder",
+    note: "Sandbox crafting and grass blocks.",
+    swatches: ["#2f7d32", "#8bc34a", "#795548"]
+  },
+  {
+    id: "battle-royale",
+    name: "Battle Royale",
+    note: "Stormy drop-zone colors.",
+    swatches: ["#6d28d9", "#06b6d4", "#f97316"]
+  },
+  {
+    id: "tactical-neon",
+    name: "Tactical Neon",
+    note: "Sharp neon team-match feel.",
+    swatches: ["#0f766e", "#fb7185", "#facc15"]
+  },
+  {
+    id: "rocket-pitch",
+    name: "Rocket Pitch",
+    note: "Cars, stadium lights, and boosts.",
+    swatches: ["#0369a1", "#f97316", "#84cc16"]
+  },
+  {
+    id: "cozy-valley",
+    name: "Cozy Valley",
+    note: "Soft farming-sim comfort.",
+    swatches: ["#7c3f16", "#65a30d", "#f59e0b"]
+  },
+  {
+    id: "space-crew",
+    name: "Space Crew",
+    note: "Clean starship console vibe.",
+    swatches: ["#334155", "#38bdf8", "#ef4444"]
+  },
+  {
+    id: "pixel-arcade",
+    name: "Pixel Arcade",
+    note: "Retro cabinet color pop.",
+    swatches: ["#7c3aed", "#f59e0b", "#10b981"]
+  },
+  {
+    id: "fantasy-quest",
+    name: "Fantasy Quest",
+    note: "Guild hall, maps, and magic.",
+    swatches: ["#365314", "#a16207", "#8b5cf6"]
+  },
+  {
+    id: "stealth-mode",
+    name: "Stealth Mode",
+    note: "Quiet dark-school notebook feel.",
+    swatches: ["#1f2937", "#14b8a6", "#64748b"]
+  },
+  {
+    id: "candy-pop",
+    name: "Candy Pop",
+    note: "Bright, sweet, and playful.",
+    swatches: ["#db2777", "#06b6d4", "#fbbf24"]
+  },
+  {
+    id: "ocean-ops",
+    name: "Ocean Ops",
+    note: "Blue, teal, and focused.",
+    swatches: ["#0f766e", "#0284c7", "#f59e0b"]
+  },
+  {
+    id: "sports-night",
+    name: "Sports Night",
+    note: "Scoreboard contrast and turf.",
+    swatches: ["#166534", "#facc15", "#dc2626"]
+  },
+  {
+    id: "lava-core",
+    name: "Lava Core",
+    note: "Hot, bold dungeon glow.",
+    swatches: ["#991b1b", "#f97316", "#facc15"]
+  }
+] as const;
+
+type ThemeId = (typeof themeOptions)[number]["id"];
+type NotificationState = NotificationPermission | "unsupported";
 
 type Notice = {
   type: "error" | "info" | "success";
@@ -167,6 +264,10 @@ function writeMessageDraft(profileId: string, conversationId: string, value: str
   } catch {
     // Drafts are a local convenience, so blocked browser storage is harmless.
   }
+}
+
+function isThemeId(value: string | null): value is ThemeId {
+  return themeOptions.some((theme) => theme.id === value);
 }
 
 function isAppAdmin(profile?: Profile | null) {
@@ -506,7 +607,14 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isDetailsOpen, setIsDetailsOpen] = useState(false);
   const [isGroupComposerOpen, setIsGroupComposerOpen] = useState(false);
+  const [isSetupOpen, setIsSetupOpen] = useState(false);
+  const [setupMessage, setSetupMessage] = useState<string | null>(null);
   const [soundEnabled, setSoundEnabled] = useState(false);
+  const [browserNotificationsEnabled, setBrowserNotificationsEnabled] =
+    useState(false);
+  const [notificationPermission, setNotificationPermission] =
+    useState<NotificationState>("default");
+  const [themeId, setThemeId] = useState<ThemeId>("lumen");
   const [typingProfiles, setTypingProfiles] = useState<Profile[]>([]);
   const [isOffline, setIsOffline] = useState(false);
   const [realtimeStatus, setRealtimeStatus] =
@@ -1020,6 +1128,17 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     }
   }, [activeConversationId, loadConversations, loadMessages]);
 
+  const applyTheme = useCallback((nextTheme: ThemeId) => {
+    document.documentElement.dataset.theme = nextTheme;
+    setThemeId(nextTheme);
+
+    try {
+      window.localStorage.setItem("lumen-theme", nextTheme);
+    } catch {
+      // Theme choice is local polish only.
+    }
+  }, []);
+
   const playNotificationSound = useCallback(() => {
     if (!soundEnabled) {
       return;
@@ -1038,6 +1157,48 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     void context.resume().then(() => playLumenChime(context)).catch(() => undefined);
   }, [soundEnabled]);
 
+  const showBrowserNotification = useCallback(
+    (row: Record<string, unknown> | null | undefined) => {
+      if (
+        !browserNotificationsEnabled ||
+        notificationPermission !== "granted" ||
+        typeof window.Notification === "undefined"
+      ) {
+        return;
+      }
+
+      const conversationId = row?.conversation_id ? String(row.conversation_id) : "";
+      const isActiveVisible =
+        conversationId === activeConversationId && document.visibilityState === "visible";
+
+      if (isActiveVisible) {
+        return;
+      }
+
+      try {
+        const body =
+          typeof row?.body === "string" && row.body.trim()
+            ? row.body.trim()
+            : "New message or file";
+        const notification = new window.Notification("Lumen Chat", {
+          body,
+          tag: row?.id ? String(row.id) : undefined
+        });
+
+        notification.onclick = () => {
+          window.focus();
+          if (conversationId) {
+            setActiveConversationId(conversationId);
+          }
+          notification.close();
+        };
+      } catch {
+        // Some browsers deny notification display even after permission.
+      }
+    },
+    [activeConversationId, browserNotificationsEnabled, notificationPermission]
+  );
+
   const playIncomingMessageSound = useCallback(
     (row: Record<string, unknown> | null | undefined) => {
       const messageId = row?.id ? String(row.id) : null;
@@ -1049,9 +1210,10 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       if (row?.sender_id && String(row.sender_id) !== profile.id) {
         lastSoundMessageIdRef.current = messageId;
         playNotificationSound();
+        showBrowserNotification(row);
       }
     },
-    [playNotificationSound, profile.id]
+    [playNotificationSound, profile.id, showBrowserNotification]
   );
 
   const toggleNotificationSound = useCallback(() => {
@@ -1081,6 +1243,75 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
 
       return next;
     });
+  }, []);
+
+  const requestBrowserNotifications = useCallback(async () => {
+    if (typeof window.Notification === "undefined") {
+      setNotificationPermission("unsupported");
+      setBrowserNotificationsEnabled(false);
+      setSetupMessage("This browser does not support website notifications.");
+      return;
+    }
+
+    try {
+      const permission = await window.Notification.requestPermission();
+      setNotificationPermission(permission);
+      const enabled = permission === "granted";
+      setBrowserNotificationsEnabled(enabled);
+
+      window.localStorage.setItem(
+        "lumen-browser-notifications",
+        enabled ? "enabled" : "disabled"
+      );
+
+      setSetupMessage(
+        enabled
+          ? "Notifications are on. Lumen can alert you when a message comes in."
+          : "Notifications were not allowed. You can change that later in browser site settings."
+      );
+    } catch {
+      setSetupMessage("Notification permission could not be requested.");
+    }
+  }, []);
+
+  const toggleBrowserNotifications = useCallback(() => {
+    if (browserNotificationsEnabled) {
+      setBrowserNotificationsEnabled(false);
+      try {
+        window.localStorage.setItem("lumen-browser-notifications", "disabled");
+      } catch {
+        // Local notification preference only.
+      }
+      setSetupMessage("Browser notifications are off for Lumen.");
+      return;
+    }
+
+    void requestBrowserNotifications();
+  }, [browserNotificationsEnabled, requestBrowserNotifications]);
+
+  const prepareChromeAutoOpen = useCallback(async () => {
+    const siteUrl = window.location.origin;
+
+    try {
+      await window.navigator.clipboard.writeText(siteUrl);
+    } catch {
+      // The message still shows the URL if clipboard access is blocked.
+    }
+
+    window.open("chrome://settings/onStartup", "_blank");
+    setSetupMessage(
+      `Copied ${siteUrl}. In Chrome, choose "Open a specific page" and add that URL so Lumen opens when Chrome opens.`
+    );
+  }, []);
+
+  const finishQuickSetup = useCallback(() => {
+    try {
+      window.localStorage.setItem("lumen-first-chat-setup-complete", "yes");
+    } catch {
+      // The pop-up can still be closed for this session.
+    }
+
+    setIsSetupOpen(false);
   }, []);
 
   const openLumenWindow = useCallback(() => {
@@ -1169,6 +1400,48 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
   useEffect(() => {
     void loadConversations();
   }, [loadConversations]);
+
+  useEffect(() => {
+    const storedTheme = (() => {
+      try {
+        return window.localStorage.getItem("lumen-theme");
+      } catch {
+        return null;
+      }
+    })();
+
+    applyTheme(isThemeId(storedTheme) ? storedTheme : "lumen");
+
+    try {
+      setIsSetupOpen(
+        window.localStorage.getItem("lumen-first-chat-setup-complete") !== "yes"
+      );
+      setSoundEnabled(
+        window.localStorage.getItem("lumen-notification-sound") === "enabled"
+      );
+    } catch {
+      setIsSetupOpen(true);
+      setSoundEnabled(false);
+    }
+
+    if (typeof window.Notification === "undefined") {
+      setNotificationPermission("unsupported");
+      setBrowserNotificationsEnabled(false);
+      return;
+    }
+
+    const permission = window.Notification.permission;
+    setNotificationPermission(permission);
+
+    try {
+      setBrowserNotificationsEnabled(
+        permission === "granted" &&
+          window.localStorage.getItem("lumen-browser-notifications") === "enabled"
+      );
+    } catch {
+      setBrowserNotificationsEnabled(permission === "granted");
+    }
+  }, [applyTheme]);
 
   useEffect(() => {
     document.title =
@@ -1275,16 +1548,6 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [isDetailsOpen, isGroupComposerOpen, profileSearch, selectedFile]);
-
-  useEffect(() => {
-    try {
-      setSoundEnabled(
-        window.localStorage.getItem("lumen-notification-sound") === "enabled"
-      );
-    } catch {
-      setSoundEnabled(false);
-    }
-  }, []);
 
   useEffect(() => {
     return () => {
@@ -1818,6 +2081,18 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                   type="button"
                 >
                   <ExternalLink size={18} aria-hidden="true" />
+                </button>
+                <button
+                  aria-label="Open setup and themes"
+                  className="flex h-10 w-10 items-center justify-center rounded-[8px] border border-ink/10 bg-white text-ink transition hover:border-moss hover:text-moss"
+                  onClick={() => {
+                    setSetupMessage(null);
+                    setIsSetupOpen(true);
+                  }}
+                  title="Setup and themes"
+                  type="button"
+                >
+                  <Palette size={18} aria-hidden="true" />
                 </button>
                 <button
                   aria-label="Sign out"
@@ -2410,7 +2685,217 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
           supabase={supabase}
         />
       ) : null}
+
+      {isSetupOpen ? (
+        <FirstChatSetupModal
+          browserNotificationsEnabled={browserNotificationsEnabled}
+          notificationPermission={notificationPermission}
+          onClose={finishQuickSetup}
+          onPrepareAutoOpen={prepareChromeAutoOpen}
+          onSelectTheme={applyTheme}
+          onToggleBrowserNotifications={toggleBrowserNotifications}
+          onToggleSound={toggleNotificationSound}
+          setupMessage={setupMessage}
+          soundEnabled={soundEnabled}
+          themeId={themeId}
+        />
+      ) : null}
     </main>
+  );
+}
+
+function FirstChatSetupModal({
+  browserNotificationsEnabled,
+  notificationPermission,
+  onClose,
+  onPrepareAutoOpen,
+  onSelectTheme,
+  onToggleBrowserNotifications,
+  onToggleSound,
+  setupMessage,
+  soundEnabled,
+  themeId
+}: {
+  browserNotificationsEnabled: boolean;
+  notificationPermission: NotificationState;
+  onClose: () => void;
+  onPrepareAutoOpen: () => void;
+  onSelectTheme: (theme: ThemeId) => void;
+  onToggleBrowserNotifications: () => void;
+  onToggleSound: () => void;
+  setupMessage: string | null;
+  soundEnabled: boolean;
+  themeId: ThemeId;
+}) {
+  const notificationLabel = browserNotificationsEnabled
+    ? "Notifications on"
+    : notificationPermission === "denied"
+      ? "Notifications blocked"
+      : notificationPermission === "unsupported"
+        ? "Notifications unavailable"
+        : "Turn on notifications";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/35 px-4 py-4 sm:py-8">
+      <section className="scrollbar-soft max-h-[calc(100dvh-2rem)] w-full max-w-4xl overflow-y-auto rounded-[8px] border border-ink/10 bg-cloud p-5 shadow-soft sm:max-h-[calc(100dvh-4rem)] sm:p-6">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase text-moss">
+              Before your first chat
+            </p>
+            <h2 className="mt-1 text-2xl font-semibold tracking-normal text-ink">
+              Set up Lumen your way
+            </h2>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-ink/65">
+              Pick a theme, choose alerts, and copy the link Chrome needs if you
+              want Lumen to open whenever Chrome starts.
+            </p>
+          </div>
+          <button
+            aria-label="Close setup"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[8px] border border-ink/10 bg-white text-ink"
+            onClick={onClose}
+            title="Close"
+            type="button"
+          >
+            <X size={18} aria-hidden="true" />
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-3 md:grid-cols-3">
+          <button
+            className={clsx(
+              "flex items-center gap-3 rounded-[8px] border bg-white px-3 py-3 text-left transition hover:border-moss disabled:cursor-not-allowed disabled:opacity-60",
+              browserNotificationsEnabled ? "border-moss" : "border-ink/10"
+            )}
+            disabled={notificationPermission === "unsupported"}
+            onClick={onToggleBrowserNotifications}
+            type="button"
+          >
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[8px] bg-jade/15 text-moss">
+              <Bell size={18} aria-hidden="true" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-sm font-semibold text-ink">
+                {notificationLabel}
+              </span>
+              <span className="block text-xs leading-5 text-ink/55">
+                Browser popups for new messages.
+              </span>
+            </span>
+          </button>
+
+          <button
+            className={clsx(
+              "flex items-center gap-3 rounded-[8px] border bg-white px-3 py-3 text-left transition hover:border-moss",
+              soundEnabled ? "border-moss" : "border-ink/10"
+            )}
+            onClick={onToggleSound}
+            type="button"
+          >
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[8px] bg-jade/15 text-moss">
+              {soundEnabled ? (
+                <Bell size={18} aria-hidden="true" />
+              ) : (
+                <BellOff size={18} aria-hidden="true" />
+              )}
+            </span>
+            <span className="min-w-0">
+              <span className="block text-sm font-semibold text-ink">
+                {soundEnabled ? "Sound on" : "Sound off"}
+              </span>
+              <span className="block text-xs leading-5 text-ink/55">
+                Original Lumen chime.
+              </span>
+            </span>
+          </button>
+
+          <button
+            className="flex items-center gap-3 rounded-[8px] border border-ink/10 bg-white px-3 py-3 text-left transition hover:border-moss"
+            onClick={onPrepareAutoOpen}
+            type="button"
+          >
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[8px] bg-jade/15 text-moss">
+              <ExternalLink size={18} aria-hidden="true" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-sm font-semibold text-ink">
+                Set Chrome auto-open
+              </span>
+              <span className="block text-xs leading-5 text-ink/55">
+                Copies the URL and opens the setting.
+              </span>
+            </span>
+          </button>
+        </div>
+
+        {setupMessage ? (
+          <p className="mt-4 rounded-[8px] border border-ink/10 bg-white px-3 py-2 text-sm leading-6 text-ink/70">
+            {setupMessage}
+          </p>
+        ) : null}
+
+        <div className="mt-6">
+          <div className="flex items-center gap-2">
+            <Palette className="text-moss" size={18} aria-hidden="true" />
+            <h3 className="text-sm font-semibold uppercase text-ink/65">
+              Themes
+            </h3>
+          </div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {themeOptions.map((theme) => (
+              <button
+                className={clsx(
+                  "rounded-[8px] border bg-white p-3 text-left transition hover:border-moss",
+                  theme.id === themeId ? "border-moss shadow-sm" : "border-ink/10"
+                )}
+                key={theme.id}
+                onClick={() => onSelectTheme(theme.id)}
+                type="button"
+              >
+                <span className="flex items-center justify-between gap-3">
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-semibold text-ink">
+                      {theme.name}
+                    </span>
+                    <span className="mt-0.5 block truncate text-xs text-ink/55">
+                      {theme.note}
+                    </span>
+                  </span>
+                  {theme.id === themeId ? (
+                    <Check className="shrink-0 text-moss" size={17} aria-hidden="true" />
+                  ) : null}
+                </span>
+                <span className="mt-3 flex gap-1.5">
+                  {theme.swatches.map((swatch) => (
+                    <span
+                      aria-hidden="true"
+                      className="h-5 flex-1 rounded-[6px] border border-black/10"
+                      key={swatch}
+                      style={{ backgroundColor: swatch }}
+                    />
+                  ))}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-6 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-xs leading-5 text-ink/55">
+            Chrome startup still has to be approved in Chrome settings; websites
+            are not allowed to secretly change that.
+          </p>
+          <button
+            className="rounded-[8px] bg-ink px-4 py-3 text-sm font-semibold text-white transition hover:bg-moss"
+            onClick={onClose}
+            type="button"
+          >
+            Continue to chat
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 

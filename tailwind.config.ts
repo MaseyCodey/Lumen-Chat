@@ -5,15 +5,15 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        ink: "#17211d",
-        moss: "#1f6f56",
-        jade: "#2fb789",
-        sun: "#f2b84b",
-        coral: "#ee6f57",
-        cloud: "#f7f4ee"
+        ink: "rgb(var(--color-ink) / <alpha-value>)",
+        moss: "rgb(var(--color-moss) / <alpha-value>)",
+        jade: "rgb(var(--color-jade) / <alpha-value>)",
+        sun: "rgb(var(--color-sun) / <alpha-value>)",
+        coral: "rgb(var(--color-coral) / <alpha-value>)",
+        cloud: "rgb(var(--color-cloud) / <alpha-value>)"
       },
       boxShadow: {
-        soft: "0 20px 70px rgba(23, 33, 29, 0.16)"
+        soft: "0 20px 70px rgb(var(--color-shadow) / 0.16)"
       }
     }
   },

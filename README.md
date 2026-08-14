@@ -24,6 +24,9 @@ only as the OAuth provider and profile-photo source.
 - Read receipts
 - Timestamps
 - Optional original notification chime for incoming messages
+- Optional browser notifications for incoming messages while Lumen is open
+- First-chat setup popup for notifications, sound, Chrome startup help, and themes
+- 15 saved themes, including several popular-game-inspired visual vibes
 - Chat search that finds existing conversations and people
 - Local draft saving per conversation
 - Paste and drag-and-drop file attachment support
@@ -238,13 +241,21 @@ rules ask users to use their real name, be respectful, protect private
 information, avoid unsafe uploads, respect school rules, and tell a trusted
 adult or teacher if something feels wrong.
 
-## Notification Sound and Open Button
+## Notifications, Themes, and Chrome Startup
 
 The bell button turns on an original Lumen notification chime for new incoming
 messages. It is intentionally not a copied Google Chat sound.
 
-The window button opens Lumen in its own browser window. A website cannot safely
-force itself to open every time Chrome opens, so set that part in Chrome:
+The first-chat setup popup can also ask the browser for notification permission.
+Browser notifications work while Lumen is open in a browser tab or window.
+
+The palette button opens setup again so users can switch between 15 saved
+themes. Some themes are inspired by familiar game genres and popular-game vibes,
+but they do not use official names, logos, artwork, or branding.
+
+The startup button copies the Lumen site URL and tries to open Chrome startup
+settings. A website cannot safely force itself to open every time Chrome opens,
+so set that part in Chrome:
 
 1. Open Chrome settings.
 2. Go to **On startup**.
