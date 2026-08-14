@@ -15,12 +15,20 @@ only as the OAuth provider and profile-photo source.
 - Onboarding that requires first and last name and states that users must use a real name
 - Profile search by full name or email
 - Secure one-to-one direct messages
-- Group chats with named rooms and multiple members
+- Group chats with named rooms, multiple members, and optional group pictures
+- Group admins can add people after creation and promote members to group admin
+- Built-in app admins: `hellerud.mason@gmail.com` and `mase.hellerud@unbound.school`
 - Supabase Realtime updates for conversations, messages, read receipts, attachments, and typing
 - Typing indicators
 - Unread badges
 - Read receipts
 - Timestamps
+- Optional original notification chime for incoming messages
+- Chat search that finds existing conversations and people
+- Local draft saving per conversation
+- Paste and drag-and-drop file attachment support
+- Browser tab unread count
+- Escape key closes popups, clears search, or removes a selected file
 - Private image, GIF, video, and general file attachments up to 1 GB
 - Attachments expire after 7 days and are cleaned up by a secure daily job
 - Responsive mobile and desktop UI
@@ -101,7 +109,7 @@ The migration creates:
 - `typing_indicators`
 - a private `chat-attachments` storage bucket
 - RLS policies that only allow conversation members to view chat data and files
-- RPC helpers for creating direct and group conversations
+- RPC helpers for creating direct and group conversations, adding group members, assigning group admins, and saving group pictures
 - attachment expiration support
 - indexes and triggers for search, timestamps, and conversation ordering
 - Realtime publication entries for live updates
@@ -229,6 +237,19 @@ Every fresh website load opens a rules reminder before the user continues. The
 rules ask users to use their real name, be respectful, protect private
 information, avoid unsafe uploads, respect school rules, and tell a trusted
 adult or teacher if something feels wrong.
+
+## Notification Sound and Open Button
+
+The bell button turns on an original Lumen notification chime for new incoming
+messages. It is intentionally not a copied Google Chat sound.
+
+The window button opens Lumen in its own browser window. A website cannot safely
+force itself to open every time Chrome opens, so set that part in Chrome:
+
+1. Open Chrome settings.
+2. Go to **On startup**.
+3. Choose **Open a specific page or set of pages**.
+4. Add your Lumen site URL, like `https://your-vercel-domain.vercel.app`.
 
 ## Project Structure
 

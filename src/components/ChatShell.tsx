@@ -1,7 +1,7 @@
 "use client";
 
-import { oneGigabyte } from "@/lib/types";
 import { withTimeout } from "@/lib/async";
+import { oneGigabyte } from "@/lib/types";
 import type {
   Attachment,
   AttachmentKind,
@@ -15,10 +15,15 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import clsx from "clsx";
 import {
   ArrowLeft,
+  Bell,
+  BellOff,
   Check,
   CheckCheck,
+  Crown,
+  ExternalLink,
   FileText,
   Image as ImageIcon,
+  ImagePlus,
   Loader2,
   LogOut,
   MessageCircle,
@@ -35,6 +40,8 @@ import {
 } from "lucide-react";
 import {
   ChangeEvent,
+  ClipboardEvent,
+  DragEvent,
   FormEvent,
   useCallback,
   useEffect,
@@ -44,6 +51,11 @@ import {
 } from "react";
 
 const attachmentBucket = "chat-attachments";
+const adminEmails = new Set([
+  "hellerud.mason@gmail.com",
+  "mase.hellerud@unbound.school"
+]);
+const groupImageLimit = 5 * 1024 * 1024;
 
 type Notice = {
   type: "error" | "info" | "success";
@@ -132,6 +144,49 @@ function safeSearchTerm(value: string) {
     .trim();
 }
 
+function draftStorageKey(profileId: string, conversationId: string) {
+  return `lumen-draft:${profileId}:${conversationId}`;
+}
+
+function readMessageDraft(profileId: string, conversationId: string) {
+  try {
+    return window.localStorage.getItem(draftStorageKey(profileId, conversationId)) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeMessageDraft(profileId: string, conversationId: string, value: string) {
+  try {
+    const key = draftStorageKey(profileId, conversationId);
+    if (value.trim()) {
+      window.localStorage.setItem(key, value);
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // Drafts are a local convenience, so blocked browser storage is harmless.
+  }
+}
+
+function isAppAdmin(profile?: Profile | null) {
+  return Boolean(profile?.email && adminEmails.has(profile.email.toLowerCase()));
+}
+
+function canManageSummary(summary: ConversationSummary | null, profile: Profile) {
+  if (!summary || summary.conversation.type !== "group") {
+    return false;
+  }
+
+  const membership = summary.members.find((member) => member.profile_id === profile.id);
+  return Boolean(
+    membership &&
+      (membership.role === "owner" ||
+        membership.role === "admin" ||
+        isAppAdmin(profile))
+  );
+}
+
 function sanitizeFileName(value: string) {
   const clean = value.replace(/[^\w.\-]+/g, "_").replace(/^_+|_+$/g, "");
   return clean.slice(0, 140) || "attachment";
@@ -154,6 +209,44 @@ function attachmentKindFor(file: File): AttachmentKind {
   }
 
   return "file";
+}
+
+function getAudioContext() {
+  const AudioContextConstructor =
+    window.AudioContext ??
+    (window as Window & { webkitAudioContext?: typeof AudioContext })
+      .webkitAudioContext;
+
+  if (!AudioContextConstructor) {
+    return null;
+  }
+
+  return new AudioContextConstructor();
+}
+
+function playLumenChime(context: AudioContext) {
+  const now = context.currentTime;
+  const master = context.createGain();
+  master.gain.setValueAtTime(0.0001, now);
+  master.gain.exponentialRampToValueAtTime(0.18, now + 0.015);
+  master.gain.exponentialRampToValueAtTime(0.0001, now + 0.48);
+  master.connect(context.destination);
+
+  [740, 988].forEach((frequency, index) => {
+    const oscillator = context.createOscillator();
+    const noteGain = context.createGain();
+    const start = now + index * 0.13;
+
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(frequency, start);
+    noteGain.gain.setValueAtTime(0.0001, start);
+    noteGain.gain.exponentialRampToValueAtTime(0.9, start + 0.02);
+    noteGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.32);
+    oscillator.connect(noteGain);
+    noteGain.connect(master);
+    oscillator.start(start);
+    oscillator.stop(start + 0.36);
+  });
 }
 
 function formatFileSize(bytes: number) {
@@ -213,6 +306,44 @@ function isAttachmentExpired(attachment: Attachment) {
   return Date.parse(attachment.expires_at) <= Date.now();
 }
 
+async function saveGroupImage(
+  supabase: SupabaseClient,
+  conversationId: string,
+  file: File
+) {
+  const storagePath = `${conversationId}/group-image/${crypto.randomUUID()}_${sanitizeFileName(file.name)}`;
+
+  const { error: uploadError } = await withTimeout(
+    supabase.storage.from(attachmentBucket).upload(storagePath, file, {
+      cacheControl: "3600",
+      contentType: file.type || "image/jpeg",
+      upsert: false
+    }),
+    30000,
+    "The group picture upload took too long."
+  );
+
+  if (uploadError) {
+    throw uploadError;
+  }
+
+  const { error: updateError } = await withTimeout(
+    supabase.rpc("update_group_image", {
+      group_conversation_id: conversationId,
+      image_storage_path: storagePath
+    }),
+    12000,
+    "The server did not answer while saving the group picture."
+  );
+
+  if (updateError) {
+    void supabase.storage.from(attachmentBucket).remove([storagePath]);
+    throw updateError;
+  }
+
+  return storagePath;
+}
+
 function conversationTitle(summary: ConversationSummary, currentUserId: string) {
   if (summary.conversation.type === "group") {
     return summary.conversation.title || "Untitled group";
@@ -240,6 +371,32 @@ function conversationSubtitle(summary: ConversationSummary, currentUserId: strin
   );
 
   return otherMember?.profile?.email ?? "Direct message";
+}
+
+function conversationSearchText(summary: ConversationSummary, currentUserId: string) {
+  const memberText = summary.members
+    .map((member) =>
+      [
+        profileName(member.profile),
+        member.profile?.email,
+        member.role,
+        member.profile_id === currentUserId ? "me" : ""
+      ]
+        .filter(Boolean)
+        .join(" ")
+    )
+    .join(" ");
+
+  return [
+    conversationTitle(summary, currentUserId),
+    conversationSubtitle(summary, currentUserId),
+    summary.latestMessage?.body,
+    summary.latestMessage?.attachment?.file_name,
+    memberText
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
 }
 
 function Avatar({
@@ -283,16 +440,29 @@ function Avatar({
 
 function ConversationAvatar({
   summary,
-  currentUserId
+  currentUserId,
+  imageUrl
 }: {
   summary: ConversationSummary;
   currentUserId: string;
+  imageUrl?: string;
 }) {
   if (summary.conversation.type === "direct") {
     const otherMember = summary.members.find(
       (member) => member.profile_id !== currentUserId
     );
     return <Avatar profile={otherMember?.profile} />;
+  }
+
+  if (imageUrl) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        alt={conversationTitle(summary, currentUserId)}
+        className="h-10 w-10 shrink-0 rounded-[8px] object-cover"
+        src={imageUrl}
+      />
+    );
   }
 
   return (
@@ -321,6 +491,8 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
   );
   const [messages, setMessages] = useState<Message[]>([]);
   const [attachmentUrls, setAttachmentUrls] = useState<Record<string, string>>({});
+  const [draftPreviews, setDraftPreviews] = useState<Record<string, string>>({});
+  const [groupImageUrls, setGroupImageUrls] = useState<Record<string, string>>({});
   const [profileSearch, setProfileSearch] = useState("");
   const [profileResults, setProfileResults] = useState<Profile[]>([]);
   const [isSearchingProfiles, setIsSearchingProfiles] = useState(false);
@@ -331,18 +503,26 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
   const [isSending, setIsSending] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
   const [messageError, setMessageError] = useState<string | null>(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [isDetailsOpen, setIsDetailsOpen] = useState(false);
   const [isGroupComposerOpen, setIsGroupComposerOpen] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState(false);
   const [typingProfiles, setTypingProfiles] = useState<Profile[]>([]);
   const [isOffline, setIsOffline] = useState(false);
   const [realtimeStatus, setRealtimeStatus] =
     useState<RealtimeStatus>("connecting");
   const [realtimeRetryKey, setRealtimeRetryKey] = useState(0);
   const activeMessageIdsRef = useRef(new Set<string>());
+  const audioContextRef = useRef<AudioContext | null>(null);
   const conversationRefreshTimerRef = useRef<number | null>(null);
+  const draftConversationRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const lastSoundMessageIdRef = useRef<string | null>(null);
   const lastTypingAtRef = useRef(0);
   const lastReadAtByConversationRef = useRef(new Map<string, string | null>());
+  const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
   const messageRefreshTimerRef = useRef<number | null>(null);
+  const messageTextRef = useRef("");
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const realtimeReconnectTimerRef = useRef<number | null>(null);
 
@@ -363,6 +543,89 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     });
     return map;
   }, [activeSummary]);
+
+  const activeGroupImageUrl = activeSummary
+    ? groupImageUrls[activeSummary.conversation.id]
+    : undefined;
+  const activeCanManageGroup = canManageSummary(activeSummary, profile);
+  const totalUnreadCount = useMemo(
+    () =>
+      conversations.reduce(
+        (total, summary) => total + Math.max(summary.unreadCount, 0),
+        0
+      ),
+    [conversations]
+  );
+  const cleanProfileSearch = safeSearchTerm(profileSearch);
+
+  const matchingChatResults = useMemo(() => {
+    if (cleanProfileSearch.length < 2) {
+      return [];
+    }
+
+    const lowerTerm = cleanProfileSearch.toLowerCase();
+    return conversations
+      .filter((summary) =>
+        conversationSearchText(summary, profile.id).includes(lowerTerm)
+      )
+      .slice(0, 6);
+  }, [cleanProfileSearch, conversations, profile.id]);
+
+  const refreshDraftPreviews = useCallback(
+    (summaries: ConversationSummary[]) => {
+      setDraftPreviews(
+        Object.fromEntries(
+          summaries
+            .map((summary) => [
+              summary.conversation.id,
+              readMessageDraft(profile.id, summary.conversation.id).trim()
+            ])
+            .filter(([, draft]) => Boolean(draft))
+        )
+      );
+    },
+    [profile.id]
+  );
+
+  const signGroupImageUrls = useCallback(
+    async (summaries: ConversationSummary[]) => {
+      const groupsWithImages = summaries.filter(
+        (summary) =>
+          summary.conversation.type === "group" &&
+          Boolean(summary.conversation.image_path)
+      );
+
+      if (groupsWithImages.length === 0) {
+        setGroupImageUrls({});
+        return;
+      }
+
+      const entries = await Promise.all(
+        groupsWithImages.map(async (summary) => {
+          const imagePath = summary.conversation.image_path;
+
+          if (!imagePath) {
+            return [summary.conversation.id, ""] as const;
+          }
+
+          const { data } = await withTimeout(
+            supabase.storage
+              .from(attachmentBucket)
+              .createSignedUrl(imagePath, 60 * 60),
+            8000,
+            "The group picture could not be loaded."
+          ).catch(() => ({ data: null }));
+
+          return [summary.conversation.id, data?.signedUrl ?? ""] as const;
+        })
+      );
+
+      setGroupImageUrls(
+        Object.fromEntries(entries.filter(([, url]) => Boolean(url)))
+      );
+    },
+    [supabase]
+  );
 
   const loadConversations = useCallback(async (options: LoadOptions = {}) => {
     if (!options.silent) {
@@ -397,6 +660,8 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
 
       if (conversationIds.length === 0) {
         setConversations([]);
+        setDraftPreviews({});
+        setGroupImageUrls({});
         setActiveConversationId(null);
         return;
       }
@@ -488,6 +753,8 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         });
 
       setConversations(nextSummaries);
+      refreshDraftPreviews(nextSummaries);
+      void signGroupImageUrls(nextSummaries);
       setActiveConversationId((current) => {
         if (current && nextSummaries.some((summary) => summary.conversation.id === current)) {
           return current;
@@ -512,7 +779,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         setIsLoadingConversations(false);
       }
     }
-  }, [profile.id, supabase]);
+  }, [profile.id, refreshDraftPreviews, signGroupImageUrls, supabase]);
 
   const signAttachmentUrls = useCallback(
     async (nextMessages: Message[]) => {
@@ -753,6 +1020,100 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     }
   }, [activeConversationId, loadConversations, loadMessages]);
 
+  const playNotificationSound = useCallback(() => {
+    if (!soundEnabled) {
+      return;
+    }
+
+    let context = audioContextRef.current;
+    if (!context) {
+      context = getAudioContext();
+      audioContextRef.current = context;
+    }
+
+    if (!context) {
+      return;
+    }
+
+    void context.resume().then(() => playLumenChime(context)).catch(() => undefined);
+  }, [soundEnabled]);
+
+  const playIncomingMessageSound = useCallback(
+    (row: Record<string, unknown> | null | undefined) => {
+      const messageId = row?.id ? String(row.id) : null;
+
+      if (!messageId || lastSoundMessageIdRef.current === messageId) {
+        return;
+      }
+
+      if (row?.sender_id && String(row.sender_id) !== profile.id) {
+        lastSoundMessageIdRef.current = messageId;
+        playNotificationSound();
+      }
+    },
+    [playNotificationSound, profile.id]
+  );
+
+  const toggleNotificationSound = useCallback(() => {
+    setSoundEnabled((current) => {
+      const next = !current;
+
+      try {
+        window.localStorage.setItem(
+          "lumen-notification-sound",
+          next ? "enabled" : "disabled"
+        );
+      } catch {
+        // Browser storage can be blocked; the in-memory toggle still works.
+      }
+
+      if (next) {
+        let context = audioContextRef.current;
+        if (!context) {
+          context = getAudioContext();
+          audioContextRef.current = context;
+        }
+
+        if (context) {
+          void context.resume().then(() => playLumenChime(context)).catch(() => undefined);
+        }
+      }
+
+      return next;
+    });
+  }, []);
+
+  const openLumenWindow = useCallback(() => {
+    window.open(window.location.origin, "lumen-chat", "popup,width=1200,height=820");
+    setNotice({
+      type: "info",
+      text: "Lumen opened in its own window. Add this site in Chrome startup settings if you want it to open with Chrome."
+    });
+  }, []);
+
+  const updateMessageText = useCallback(
+    (value: string) => {
+      messageTextRef.current = value;
+      setMessageText(value);
+
+      if (activeConversationId) {
+        writeMessageDraft(profile.id, activeConversationId, value);
+        setDraftPreviews((current) => {
+          const next = { ...current };
+
+          if (value.trim()) {
+            next[activeConversationId] = value.trim();
+          } else {
+            delete next[activeConversationId];
+          }
+
+          return next;
+        });
+      }
+    },
+    [activeConversationId, profile.id]
+  );
+
   const announceTyping = useCallback(async () => {
     if (!activeConversationId) {
       return;
@@ -808,6 +1169,122 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
   useEffect(() => {
     void loadConversations();
   }, [loadConversations]);
+
+  useEffect(() => {
+    document.title =
+      totalUnreadCount > 0 ? `(${totalUnreadCount}) Lumen Chat` : "Lumen Chat";
+
+    return () => {
+      document.title = "Lumen Chat";
+    };
+  }, [totalUnreadCount]);
+
+  useEffect(() => {
+    const previousConversationId = draftConversationRef.current;
+
+    if (previousConversationId && previousConversationId !== activeConversationId) {
+      writeMessageDraft(profile.id, previousConversationId, messageTextRef.current);
+    }
+
+    draftConversationRef.current = activeConversationId;
+
+    const nextDraft = activeConversationId
+      ? readMessageDraft(profile.id, activeConversationId)
+      : "";
+
+    messageTextRef.current = nextDraft;
+    setMessageText(nextDraft);
+    setDraftPreviews((current) => {
+      if (!activeConversationId) {
+        return current;
+      }
+
+      const next = { ...current };
+      if (nextDraft.trim()) {
+        next[activeConversationId] = nextDraft.trim();
+      } else {
+        delete next[activeConversationId];
+      }
+
+      return next;
+    });
+    setSelectedFile(null);
+    setIsDraggingFile(false);
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }, [activeConversationId, profile.id]);
+
+  useEffect(() => {
+    return () => {
+      if (draftConversationRef.current) {
+        writeMessageDraft(
+          profile.id,
+          draftConversationRef.current,
+          messageTextRef.current
+        );
+      }
+    };
+  }, [profile.id]);
+
+  useEffect(() => {
+    const input = messageInputRef.current;
+
+    if (!input) {
+      return;
+    }
+
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 128)}px`;
+  }, [activeConversationId, messageText]);
+
+  useEffect(() => {
+    function onKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key !== "Escape") {
+        return;
+      }
+
+      if (isDetailsOpen) {
+        setIsDetailsOpen(false);
+        return;
+      }
+
+      if (isGroupComposerOpen) {
+        setIsGroupComposerOpen(false);
+        return;
+      }
+
+      if (profileSearch) {
+        setProfileSearch("");
+        setProfileResults([]);
+        return;
+      }
+
+      if (selectedFile) {
+        setSelectedFile(null);
+        if (fileInputRef.current) {
+          fileInputRef.current.value = "";
+        }
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [isDetailsOpen, isGroupComposerOpen, profileSearch, selectedFile]);
+
+  useEffect(() => {
+    try {
+      setSoundEnabled(
+        window.localStorage.getItem("lumen-notification-sound") === "enabled"
+      );
+    } catch {
+      setSoundEnabled(false);
+    }
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -905,7 +1382,10 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "messages" },
-        () => queueConversationsRefresh()
+        (payload) => {
+          playIncomingMessageSound(payload.new as Record<string, unknown>);
+          queueConversationsRefresh();
+        }
       )
       .subscribe((status) => {
         if (status === "SUBSCRIBED") {
@@ -922,6 +1402,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
   }, [
     handleRealtimeStatus,
     profile.id,
+    playIncomingMessageSound,
     queueConversationsRefresh,
     realtimeRetryKey,
     scheduleRealtimeReconnect,
@@ -957,7 +1438,8 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
           table: "messages",
           filter: `conversation_id=eq.${activeConversationId}`
         },
-        () => {
+        (payload) => {
+          playIncomingMessageSound(payload.new as Record<string, unknown>);
           queueMessagesRefresh(activeConversationId);
         }
       )
@@ -1023,6 +1505,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     handleRealtimeStatus,
     loadMessages,
     loadTyping,
+    playIncomingMessageSound,
     queueMessagesRefresh,
     realtimeRetryKey,
     scheduleRealtimeReconnect,
@@ -1064,26 +1547,34 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     }
   }
 
-  function selectFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0] ?? null;
+  function attachFile(file: File | null) {
     setNotice(null);
 
     if (!file) {
       setSelectedFile(null);
-      return;
+      return true;
     }
 
     if (file.size > oneGigabyte) {
       setSelectedFile(null);
-      event.target.value = "";
       setNotice({
         type: "error",
         text: "That file is larger than the 1 GB limit."
       });
-      return;
+      return false;
     }
 
     setSelectedFile(file);
+    return true;
+  }
+
+  function selectFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    const accepted = attachFile(file);
+
+    if (!accepted || !file) {
+      event.target.value = "";
+    }
   }
 
   function clearSelectedFile() {
@@ -1091,6 +1582,47 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
+  }
+
+  function handleMessagePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const file = Array.from(event.clipboardData.files)[0] ?? null;
+
+    if (!file) {
+      return;
+    }
+
+    if (attachFile(file)) {
+      event.preventDefault();
+    }
+  }
+
+  function handleConversationDragOver(event: DragEvent<HTMLElement>) {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) {
+      return;
+    }
+
+    event.preventDefault();
+    setIsDraggingFile(true);
+  }
+
+  function handleConversationDragLeave(event: DragEvent<HTMLElement>) {
+    const nextTarget = event.relatedTarget;
+
+    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) {
+      return;
+    }
+
+    setIsDraggingFile(false);
+  }
+
+  function handleConversationDrop(event: DragEvent<HTMLElement>) {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) {
+      return;
+    }
+
+    event.preventDefault();
+    setIsDraggingFile(false);
+    attachFile(Array.from(event.dataTransfer.files)[0] ?? null);
   }
 
   async function uploadAttachment(conversationId: string, file: File) {
@@ -1190,7 +1722,14 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
           : [...current, sentMessage]
       );
       void signAttachmentUrls([sentMessage]);
+      messageTextRef.current = "";
       setMessageText("");
+      writeMessageDraft(profile.id, activeConversationId, "");
+      setDraftPreviews((current) => {
+        const next = { ...current };
+        delete next[activeConversationId];
+        return next;
+      });
       clearSelectedFile();
       void withTimeout(
         supabase
@@ -1248,15 +1787,48 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                   </p>
                 </div>
               </div>
-              <button
-                aria-label="Sign out"
-                className="flex h-10 w-10 items-center justify-center rounded-[8px] border border-ink/10 bg-white text-ink transition hover:border-coral hover:text-coral"
-                onClick={() => void supabase.auth.signOut()}
-                title="Sign out"
-                type="button"
-              >
-                <LogOut size={18} aria-hidden="true" />
-              </button>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  aria-label={
+                    soundEnabled
+                      ? "Turn notification sound off"
+                      : "Turn notification sound on"
+                  }
+                  className={clsx(
+                    "flex h-10 w-10 items-center justify-center rounded-[8px] border bg-white text-ink transition",
+                    soundEnabled
+                      ? "border-moss text-moss"
+                      : "border-ink/10 hover:border-moss hover:text-moss"
+                  )}
+                  onClick={toggleNotificationSound}
+                  title={soundEnabled ? "Sound on" : "Sound off"}
+                  type="button"
+                >
+                  {soundEnabled ? (
+                    <Bell size={18} aria-hidden="true" />
+                  ) : (
+                    <BellOff size={18} aria-hidden="true" />
+                  )}
+                </button>
+                <button
+                  aria-label="Open Lumen in its own window"
+                  className="flex h-10 w-10 items-center justify-center rounded-[8px] border border-ink/10 bg-white text-ink transition hover:border-moss hover:text-moss"
+                  onClick={openLumenWindow}
+                  title="Open Lumen window"
+                  type="button"
+                >
+                  <ExternalLink size={18} aria-hidden="true" />
+                </button>
+                <button
+                  aria-label="Sign out"
+                  className="flex h-10 w-10 items-center justify-center rounded-[8px] border border-ink/10 bg-white text-ink transition hover:border-coral hover:text-coral"
+                  onClick={() => void supabase.auth.signOut()}
+                  title="Sign out"
+                  type="button"
+                >
+                  <LogOut size={18} aria-hidden="true" />
+                </button>
+              </div>
             </div>
 
             {isOffline ? (
@@ -1299,11 +1871,25 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                 />
                 <input
                   aria-label="Find people by name or email"
-                  className="h-11 w-full rounded-[8px] border border-ink/10 bg-white pl-9 pr-3 text-sm text-ink shadow-sm"
+                  className="h-11 w-full rounded-[8px] border border-ink/10 bg-white pl-9 pr-9 text-sm text-ink shadow-sm"
                   onChange={(event) => setProfileSearch(event.target.value)}
                   placeholder="Find by name or email"
                   value={profileSearch}
                 />
+                {profileSearch ? (
+                  <button
+                    aria-label="Clear search"
+                    className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-[8px] text-ink/45 transition hover:bg-ink/5 hover:text-ink"
+                    onClick={() => {
+                      setProfileSearch("");
+                      setProfileResults([]);
+                    }}
+                    title="Clear search"
+                    type="button"
+                  >
+                    <X size={15} aria-hidden="true" />
+                  </button>
+                ) : null}
               </div>
               <button
                 aria-label="Create group chat"
@@ -1332,8 +1918,56 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
             </div>
           ) : null}
 
-          {profileSearch.trim().length >= 2 ? (
+          {cleanProfileSearch.length >= 2 ? (
             <div className="border-b border-ink/10 p-4">
+              {matchingChatResults.length > 0 ? (
+                <div className="mb-4">
+                  <p className="mb-2 text-xs font-semibold uppercase text-ink/50">
+                    Chats
+                  </p>
+                  <div className="space-y-2">
+                    {matchingChatResults.map((summary) => (
+                      <button
+                        className="flex w-full items-center gap-3 rounded-[8px] border border-ink/10 bg-white px-3 py-2 text-left transition hover:border-moss"
+                        key={summary.conversation.id}
+                        onClick={() => {
+                          setActiveConversationId(summary.conversation.id);
+                          setProfileSearch("");
+                          setProfileResults([]);
+                        }}
+                        type="button"
+                      >
+                        <ConversationAvatar
+                          currentUserId={profile.id}
+                          imageUrl={groupImageUrls[summary.conversation.id]}
+                          summary={summary}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-semibold text-ink">
+                            {conversationTitle(summary, profile.id)}
+                          </span>
+                          <span className="block truncate text-xs text-ink/55">
+                            {draftPreviews[summary.conversation.id] ? (
+                              <>
+                                <span className="font-semibold text-coral">
+                                  Draft:
+                                </span>{" "}
+                                {draftPreviews[summary.conversation.id]}
+                              </>
+                            ) : summary.latestMessage?.attachment ? (
+                              summary.latestMessage.attachment.file_name
+                            ) : (
+                              summary.latestMessage?.body ||
+                              conversationSubtitle(summary, profile.id)
+                            )}
+                          </span>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
               <div className="mb-2 flex items-center justify-between">
                 <p className="text-xs font-semibold uppercase text-ink/50">People</p>
                 {isSearchingProfiles ? (
@@ -1412,7 +2046,11 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                   onClick={() => setActiveConversationId(summary.conversation.id)}
                   type="button"
                 >
-                  <ConversationAvatar summary={summary} currentUserId={profile.id} />
+                  <ConversationAvatar
+                    currentUserId={profile.id}
+                    imageUrl={groupImageUrls[summary.conversation.id]}
+                    summary={summary}
+                  />
                   <span className="min-w-0 flex-1">
                     <span className="flex items-center gap-2">
                       <span className="truncate text-sm font-semibold text-ink">
@@ -1427,9 +2065,17 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                       ) : null}
                     </span>
                     <span className="mt-0.5 block truncate text-xs text-ink/55">
-                      {summary.latestMessage?.attachment
-                        ? summary.latestMessage.attachment.file_name
-                        : summary.latestMessage?.body || conversationSubtitle(summary, profile.id)}
+                      {draftPreviews[summary.conversation.id] ? (
+                        <>
+                          <span className="font-semibold text-coral">Draft:</span>{" "}
+                          {draftPreviews[summary.conversation.id]}
+                        </>
+                      ) : summary.latestMessage?.attachment ? (
+                        summary.latestMessage.attachment.file_name
+                      ) : (
+                        summary.latestMessage?.body ||
+                        conversationSubtitle(summary, profile.id)
+                      )}
                     </span>
                   </span>
                   <span className="flex shrink-0 flex-col items-end gap-1">
@@ -1452,11 +2098,22 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         </aside>
 
         <section
+          onDragLeave={handleConversationDragLeave}
+          onDragOver={handleConversationDragOver}
+          onDrop={handleConversationDrop}
           className={clsx(
-            "min-w-0 flex-1 flex-col bg-cloud/65",
+            "relative min-w-0 flex-1 flex-col bg-cloud/65",
             activeConversationId ? "flex" : "hidden lg:flex"
           )}
         >
+          {isDraggingFile && activeConversationId ? (
+            <div className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-[8px] border-2 border-dashed border-moss bg-cloud/85 text-sm font-semibold text-ink shadow-soft backdrop-blur">
+              <span className="inline-flex items-center gap-2 rounded-[8px] bg-white px-3 py-2">
+                <Paperclip size={17} aria-hidden="true" />
+                Drop to attach
+              </span>
+            </div>
+          ) : null}
           {activeSummary ? (
             <>
               <header className="flex min-h-[5rem] items-center gap-3 border-b border-ink/10 bg-white/70 px-4">
@@ -1469,7 +2126,11 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                 >
                   <ArrowLeft size={19} aria-hidden="true" />
                 </button>
-                <ConversationAvatar summary={activeSummary} currentUserId={profile.id} />
+                <ConversationAvatar
+                  currentUserId={profile.id}
+                  imageUrl={activeGroupImageUrl}
+                  summary={activeSummary}
+                />
                 <div className="min-w-0 flex-1">
                   <h2 className="truncate text-base font-semibold text-ink">
                     {activeTitle}
@@ -1480,7 +2141,9 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                 </div>
                 <button
                   aria-label="Conversation details"
-                  className="flex h-10 w-10 items-center justify-center rounded-[8px] border border-ink/10 bg-white text-ink"
+                  className="flex h-10 w-10 items-center justify-center rounded-[8px] border border-ink/10 bg-white text-ink transition hover:border-moss hover:text-moss disabled:cursor-not-allowed disabled:text-ink/35"
+                  disabled={activeSummary.conversation.type !== "group"}
+                  onClick={() => setIsDetailsOpen(true)}
                   title="Conversation details"
                   type="button"
                 >
@@ -1660,7 +2323,7 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                     className="max-h-32 min-h-11 flex-1 resize-none rounded-[8px] border border-ink/10 bg-white px-3 py-3 text-sm leading-5 text-ink shadow-sm"
                     disabled={isOffline}
                     onChange={(event) => {
-                      setMessageText(event.target.value);
+                      updateMessageText(event.target.value);
                       if (event.target.value.trim()) {
                         void announceTyping();
                       }
@@ -1671,7 +2334,10 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
                         event.currentTarget.form?.requestSubmit();
                       }
                     }}
+                    onPaste={handleMessagePaste}
                     placeholder={isOffline ? "Sending is paused offline" : "Message"}
+                    ref={messageInputRef}
+                    rows={1}
                     value={messageText}
                   />
                   <button
@@ -1719,11 +2385,28 @@ export function ChatShell({ profile, supabase }: ChatShellProps) {
         <GroupComposer
           currentProfile={profile}
           onClose={() => setIsGroupComposerOpen(false)}
-          onCreated={(conversationId) => {
+          onCreated={(conversationId, warning) => {
             setIsGroupComposerOpen(false);
             setActiveConversationId(conversationId);
+            if (warning) {
+              setNotice({ type: "info", text: warning });
+            }
             queueConversationsRefresh();
           }}
+          supabase={supabase}
+        />
+      ) : null}
+
+      {isDetailsOpen && activeSummary?.conversation.type === "group" ? (
+        <GroupDetailsModal
+          canManage={activeCanManageGroup}
+          currentProfile={profile}
+          imageUrl={activeGroupImageUrl}
+          onChanged={() => {
+            void loadConversations({ silent: true });
+          }}
+          onClose={() => setIsDetailsOpen(false)}
+          summary={activeSummary}
           supabase={supabase}
         />
       ) : null}
@@ -1860,6 +2543,471 @@ function AttachmentPreview({
   );
 }
 
+function GroupDetailsModal({
+  canManage,
+  currentProfile,
+  imageUrl,
+  onChanged,
+  onClose,
+  summary,
+  supabase
+}: {
+  canManage: boolean;
+  currentProfile: Profile;
+  imageUrl?: string;
+  onChanged: () => void;
+  onClose: () => void;
+  summary: ConversationSummary;
+  supabase: SupabaseClient;
+}) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<Profile[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [isSavingImage, setIsSavingImage] = useState(false);
+  const [busyMemberId, setBusyMemberId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const memberIds = useMemo(
+    () => new Set(summary.members.map((member) => member.profile_id)),
+    [summary.members]
+  );
+
+  useEffect(() => {
+    const term = safeSearchTerm(query);
+
+    if (term.length < 2 || !canManage) {
+      setResults([]);
+      setIsSearching(false);
+      return;
+    }
+
+    setIsSearching(true);
+    let cancelled = false;
+    const timeout = window.setTimeout(async () => {
+      try {
+        const { data, error: searchError } = await withTimeout(
+          supabase
+            .from("profiles")
+            .select("*")
+            .neq("id", currentProfile.id)
+            .eq("onboarding_complete", true)
+            .or(`full_name.ilike.%${term}%,email.ilike.%${term}%`)
+            .limit(10),
+          10000,
+          "People search took too long."
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        if (searchError) {
+          throw searchError;
+        }
+
+        setResults(
+          ((data ?? []) as Profile[]).filter((profile) => !memberIds.has(profile.id))
+        );
+      } catch (caughtError) {
+        if (!cancelled) {
+          setError(
+            caughtError instanceof Error
+              ? caughtError.message
+              : "People search failed."
+          );
+          setResults([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsSearching(false);
+        }
+      }
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [canManage, currentProfile.id, memberIds, query, supabase]);
+
+  async function addMember(profile: Profile) {
+    if (!canManage) {
+      return;
+    }
+
+    setBusyMemberId(profile.id);
+    setError(null);
+
+    try {
+      const { error: addError } = await withTimeout(
+        supabase.rpc("add_group_members", {
+          group_conversation_id: summary.conversation.id,
+          member_ids: [profile.id]
+        }),
+        12000,
+        "The server did not answer while adding that person."
+      );
+
+      if (addError) {
+        throw addError;
+      }
+
+      setQuery("");
+      setResults([]);
+      onChanged();
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "That person could not be added."
+      );
+    } finally {
+      setBusyMemberId(null);
+    }
+  }
+
+  async function changeRole(member: ConversationMember, role: "admin" | "member") {
+    if (!canManage || member.role === "owner") {
+      return;
+    }
+
+    setBusyMemberId(member.profile_id);
+    setError(null);
+
+    try {
+      const { error: roleError } = await withTimeout(
+        supabase.rpc("set_group_member_role", {
+          group_conversation_id: summary.conversation.id,
+          target_profile_id: member.profile_id,
+          new_role: role
+        }),
+        12000,
+        "The server did not answer while changing that role."
+      );
+
+      if (roleError) {
+        throw roleError;
+      }
+
+      onChanged();
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "That role could not be changed."
+      );
+    } finally {
+      setBusyMemberId(null);
+    }
+  }
+
+  async function updateGroupImage(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    event.target.value = "";
+
+    if (!file || !canManage) {
+      return;
+    }
+
+    if (!file.type.startsWith("image/")) {
+      setError("Choose an image file for the group picture.");
+      return;
+    }
+
+    if (file.size > groupImageLimit) {
+      setError("Group pictures must be 5 MB or smaller.");
+      return;
+    }
+
+    setIsSavingImage(true);
+    setError(null);
+
+    try {
+      await saveGroupImage(supabase, summary.conversation.id, file);
+      if (summary.conversation.image_path) {
+        void supabase.storage
+          .from(attachmentBucket)
+          .remove([summary.conversation.image_path]);
+      }
+
+      onChanged();
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "The group picture could not be saved."
+      );
+    } finally {
+      setIsSavingImage(false);
+    }
+  }
+
+  async function removeGroupImage() {
+    if (!canManage) {
+      return;
+    }
+
+    setIsSavingImage(true);
+    setError(null);
+
+    try {
+      const previousPath = summary.conversation.image_path;
+      const { error: updateError } = await withTimeout(
+        supabase.rpc("update_group_image", {
+          group_conversation_id: summary.conversation.id,
+          image_storage_path: null
+        }),
+        12000,
+        "The server did not answer while removing the group picture."
+      );
+
+      if (updateError) {
+        throw updateError;
+      }
+
+      if (previousPath) {
+        void supabase.storage.from(attachmentBucket).remove([previousPath]);
+      }
+
+      onChanged();
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "The group picture could not be removed."
+      );
+    } finally {
+      setIsSavingImage(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/35 px-4 py-4 sm:py-8">
+      <section className="scrollbar-soft max-h-[calc(100dvh-2rem)] w-full max-w-2xl overflow-y-auto rounded-[8px] border border-ink/10 bg-cloud p-5 shadow-soft sm:max-h-[calc(100dvh-4rem)] sm:p-6">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <h2 className="truncate text-xl font-semibold text-ink">
+              {summary.conversation.title}
+            </h2>
+            <p className="mt-1 text-sm text-ink/60">
+              {summary.members.length} member{summary.members.length === 1 ? "" : "s"}
+            </p>
+          </div>
+          <button
+            aria-label="Close group details"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[8px] border border-ink/10 bg-white text-ink"
+            onClick={onClose}
+            title="Close"
+            type="button"
+          >
+            <X size={18} aria-hidden="true" />
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-4 sm:grid-cols-[11rem_minmax(0,1fr)]">
+          <div className="flex flex-col gap-3">
+            <div className="aspect-square overflow-hidden rounded-[8px] border border-ink/10 bg-white">
+              {imageUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  alt=""
+                  className="h-full w-full object-cover"
+                  src={imageUrl}
+                />
+              ) : (
+                <div className="flex h-full w-full items-center justify-center bg-ink text-white">
+                  <Users aria-hidden="true" size={42} />
+                </div>
+              )}
+            </div>
+            {canManage ? (
+              <>
+                <input
+                  accept="image/*"
+                  className="hidden"
+                  onChange={updateGroupImage}
+                  ref={imageInputRef}
+                  type="file"
+                />
+                <button
+                  className="flex items-center justify-center gap-2 rounded-[8px] bg-ink px-3 py-2 text-sm font-semibold text-white transition hover:bg-moss disabled:cursor-not-allowed disabled:bg-ink/50"
+                  disabled={isSavingImage}
+                  onClick={() => imageInputRef.current?.click()}
+                  type="button"
+                >
+                  {isSavingImage ? (
+                    <Loader2 className="animate-spin" size={17} aria-hidden="true" />
+                  ) : (
+                    <ImagePlus size={17} aria-hidden="true" />
+                  )}
+                  Change photo
+                </button>
+                {summary.conversation.image_path ? (
+                  <button
+                    className="rounded-[8px] border border-ink/10 bg-white px-3 py-2 text-sm font-semibold text-ink transition hover:border-coral hover:text-coral"
+                    disabled={isSavingImage}
+                    onClick={() => void removeGroupImage()}
+                    type="button"
+                  >
+                    Remove photo
+                  </button>
+                ) : null}
+              </>
+            ) : null}
+          </div>
+
+          <div className="min-w-0 space-y-4">
+            {canManage ? (
+              <div>
+                <label className="block">
+                  <span className="text-xs font-semibold uppercase text-ink/60">
+                    Add people
+                  </span>
+                  <div className="relative mt-2">
+                    <Search
+                      aria-hidden="true"
+                      className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink/40"
+                      size={17}
+                    />
+                    <input
+                      className="h-11 w-full rounded-[8px] border border-ink/10 bg-white pl-9 pr-3 text-sm text-ink shadow-sm"
+                      onChange={(event) => setQuery(event.target.value)}
+                      placeholder="Search name or email"
+                      value={query}
+                    />
+                  </div>
+                </label>
+
+                {query.trim().length >= 2 ? (
+                  <div className="scrollbar-soft mt-3 max-h-44 overflow-y-auto rounded-[8px] border border-ink/10 bg-white p-2">
+                    {isSearching ? (
+                      <div className="flex items-center justify-center py-4 text-sm text-ink/60">
+                        <Loader2
+                          className="mr-2 animate-spin text-moss"
+                          size={16}
+                          aria-hidden="true"
+                        />
+                        Searching
+                      </div>
+                    ) : null}
+
+                    {!isSearching && results.length === 0 ? (
+                      <p className="px-3 py-4 text-center text-sm text-ink/55">
+                        No matching profiles.
+                      </p>
+                    ) : null}
+
+                    <div className="space-y-2">
+                      {results.map((result) => (
+                        <button
+                          className="flex w-full items-center gap-3 rounded-[8px] px-2 py-2 text-left transition hover:bg-jade/10 disabled:cursor-not-allowed disabled:opacity-60"
+                          disabled={busyMemberId === result.id}
+                          key={result.id}
+                          onClick={() => void addMember(result)}
+                          type="button"
+                        >
+                          <Avatar profile={result} size="sm" />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-sm font-semibold text-ink">
+                              {profileName(result)}
+                            </span>
+                            <span className="block truncate text-xs text-ink/55">
+                              {result.email}
+                            </span>
+                          </span>
+                          {busyMemberId === result.id ? (
+                            <Loader2
+                              className="animate-spin text-moss"
+                              size={17}
+                              aria-hidden="true"
+                            />
+                          ) : (
+                            <UserPlus className="text-moss" size={17} aria-hidden="true" />
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <p className="rounded-[8px] border border-ink/10 bg-white/70 px-3 py-2 text-sm text-ink/60">
+                Only group admins can change the photo or add people.
+              </p>
+            )}
+
+            <div>
+              <p className="text-xs font-semibold uppercase text-ink/60">Members</p>
+              <div className="mt-2 space-y-2">
+                {summary.members.map((member) => {
+                  const memberIsAppAdmin = isAppAdmin(member.profile);
+                  const canChangeRole =
+                    canManage &&
+                    member.role !== "owner" &&
+                    member.profile_id !== currentProfile.id;
+
+                  return (
+                    <div
+                      className="flex items-center gap-3 rounded-[8px] border border-ink/10 bg-white px-3 py-2"
+                      key={member.profile_id}
+                    >
+                      <Avatar profile={member.profile} size="sm" />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-semibold text-ink">
+                          {profileName(member.profile)}
+                        </p>
+                        <p className="truncate text-xs text-ink/55">
+                          {member.profile?.email}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <span
+                          className={clsx(
+                            "inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-bold uppercase",
+                            member.role === "owner" || member.role === "admin"
+                              ? "bg-sun/20 text-ink"
+                              : "bg-ink/5 text-ink/55"
+                          )}
+                        >
+                          {member.role === "owner" ? (
+                            <Crown size={12} aria-hidden="true" />
+                          ) : null}
+                          {memberIsAppAdmin ? "app admin" : member.role}
+                        </span>
+                        {canChangeRole ? (
+                          <button
+                            className="rounded-[8px] border border-ink/10 px-2 py-1 text-xs font-semibold text-ink transition hover:border-moss hover:text-moss disabled:cursor-not-allowed disabled:opacity-60"
+                            disabled={busyMemberId === member.profile_id}
+                            onClick={() =>
+                              void changeRole(
+                                member,
+                                member.role === "admin" ? "member" : "admin"
+                              )
+                            }
+                            type="button"
+                          >
+                            {member.role === "admin" ? "Make member" : "Make admin"}
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {error ? (
+              <p className="rounded-[8px] border border-coral/30 bg-coral/10 px-3 py-2 text-sm text-coral">
+                {error}
+              </p>
+            ) : null}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function GroupComposer({
   currentProfile,
   supabase,
@@ -1869,15 +3017,34 @@ function GroupComposer({
   currentProfile: Profile;
   supabase: SupabaseClient;
   onClose: () => void;
-  onCreated: (conversationId: string) => void;
+  onCreated: (conversationId: string, warning?: string) => void;
 }) {
   const [title, setTitle] = useState("");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Profile[]>([]);
   const [selected, setSelected] = useState<Profile[]>([]);
+  const [groupImageFile, setGroupImageFile] = useState<File | null>(null);
+  const [groupImagePreviewUrl, setGroupImagePreviewUrl] = useState<string | null>(
+    null
+  );
   const [isCreating, setIsCreating] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!groupImageFile) {
+      setGroupImagePreviewUrl(null);
+      return;
+    }
+
+    const previewUrl = URL.createObjectURL(groupImageFile);
+    setGroupImagePreviewUrl(previewUrl);
+
+    return () => {
+      URL.revokeObjectURL(previewUrl);
+    };
+  }, [groupImageFile]);
 
   useEffect(() => {
     const term = safeSearchTerm(query);
@@ -1941,6 +3108,28 @@ function GroupComposer({
     };
   }, [currentProfile.id, query, selected, supabase]);
 
+  function chooseGroupImage(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    if (!file.type.startsWith("image/")) {
+      setError("Choose an image file for the group picture.");
+      return;
+    }
+
+    if (file.size > groupImageLimit) {
+      setError("Group pictures must be 5 MB or smaller.");
+      return;
+    }
+
+    setError(null);
+    setGroupImageFile(file);
+  }
+
   async function createGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const cleanTitle = title.trim();
@@ -1972,7 +3161,19 @@ function GroupComposer({
         throw createError;
       }
 
-      onCreated(String(data));
+      const conversationId = String(data);
+      let warning: string | undefined;
+
+      if (groupImageFile) {
+        try {
+          await saveGroupImage(supabase, conversationId, groupImageFile);
+        } catch {
+          warning =
+            "Group was created, but the picture could not be saved. Open group details to add it.";
+        }
+      }
+
+      onCreated(conversationId, warning);
     } catch (caughtError) {
       setError(
         caughtError instanceof Error
@@ -2005,6 +3206,56 @@ function GroupComposer({
         </div>
 
         <form className="mt-5 space-y-4" onSubmit={createGroup}>
+          <div className="flex items-center gap-3 rounded-[8px] border border-ink/10 bg-white/70 p-3">
+            <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-[8px] bg-ink text-white">
+              {groupImagePreviewUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  alt=""
+                  className="h-full w-full object-cover"
+                  src={groupImagePreviewUrl}
+                />
+              ) : (
+                <Users size={26} aria-hidden="true" />
+              )}
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-semibold text-ink">
+                Group picture
+              </p>
+              <p className="mt-0.5 truncate text-xs text-ink/55">
+                {groupImageFile ? groupImageFile.name : "Optional image, 5 MB max"}
+              </p>
+            </div>
+            <input
+              accept="image/*"
+              className="hidden"
+              onChange={chooseGroupImage}
+              ref={imageInputRef}
+              type="file"
+            />
+            {groupImageFile ? (
+              <button
+                aria-label="Remove group picture"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[8px] border border-ink/10 text-ink transition hover:border-coral hover:text-coral"
+                onClick={() => setGroupImageFile(null)}
+                title="Remove picture"
+                type="button"
+              >
+                <X size={17} aria-hidden="true" />
+              </button>
+            ) : null}
+            <button
+              aria-label="Choose group picture"
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[8px] border border-ink/10 text-ink transition hover:border-moss hover:text-moss"
+              onClick={() => imageInputRef.current?.click()}
+              title="Choose picture"
+              type="button"
+            >
+              <ImagePlus size={17} aria-hidden="true" />
+            </button>
+          </div>
+
           <label className="block">
             <span className="text-xs font-semibold uppercase text-ink/60">
               Group name

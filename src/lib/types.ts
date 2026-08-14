@@ -16,6 +16,8 @@ export type Conversation = {
   id: string;
   type: ConversationKind;
   title: string | null;
+  image_path: string | null;
+  image_updated_at: string | null;
   created_by: string;
   created_at: string;
   updated_at: string;
